@@ -1,7 +1,9 @@
 # src/apex_builder_mcp/tools/audit.py
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,11 @@ from apex_builder_mcp.audit.acl import (
 )
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
+
+AUDIT_DIR: Path = Path.home() / ".apex-builder-mcp" / "audit"
+
+# Module-level frozen flag tracking emergency-stop state per session.
+_FROZEN: dict[str, str] = {}
 
 
 def _get_pool() -> Any:
@@ -55,3 +62,39 @@ def apex_diff_acl(snapshot_path: str) -> dict[str, Any]:
         "removed": [asdict(a) for a in d.removed],
         "empty": d.empty,
     }
+
+
+@apex_tool(name="apex_get_audit_log", category=Category.AUDIT_AUX)
+def apex_get_audit_log(profile: str, limit: int = 50) -> dict[str, Any]:
+    """Read most recent audit entries for a profile. Latest first."""
+    prof_dir = AUDIT_DIR / profile
+    if not prof_dir.exists():
+        return {"entries": [], "profile": profile}
+    files = sorted(prof_dir.glob("*.jsonl"), reverse=True)
+    entries: list[dict[str, Any]] = []
+    for f in files:
+        for line in reversed(f.read_text(encoding="utf-8").strip().split("\n")):
+            if line.strip():
+                entries.append(json.loads(line))
+                if len(entries) >= limit:
+                    return {"entries": entries, "profile": profile}
+    return {"entries": entries, "profile": profile}
+
+
+@apex_tool(name="apex_emergency_stop", category=Category.AUDIT_AUX)
+def apex_emergency_stop(reason: str) -> dict[str, Any]:
+    """Disconnect pool, freeze MCP for rest of session, record reason."""
+    pool = _get_pool()
+    pool.disconnect()
+    _FROZEN["reason"] = reason
+    _FROZEN["ts"] = datetime.now(UTC).isoformat()
+    return {"frozen": True, "reason": reason, "ts": _FROZEN["ts"]}
+
+
+def is_frozen() -> bool:
+    return "reason" in _FROZEN
+
+
+def _reset_frozen_for_tests() -> None:
+    """Test-only: clear frozen state."""
+    _FROZEN.clear()
