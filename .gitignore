@@ -17,7 +17,7 @@ venv/
 env/
 .env
 *.log
-audit/
+/audit/
 
 # Windows
 Thumbs.db
