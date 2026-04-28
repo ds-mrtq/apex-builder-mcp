@@ -17,12 +17,28 @@ set -u
 cd "$(dirname "$0")/.." || { echo "Cannot cd into repo root"; exit 2; }
 
 # ----------------------------------------------------------------------------
-# Prompt password (silent — never logged, never persisted)
+# Resolve password via keyring (Win Cred Mgr) — prompt only on first run
 # ----------------------------------------------------------------------------
-read -srp "Password for ereport@TEST1: " APEX_TEST_PASSWORD
-echo
-if [[ -z "$APEX_TEST_PASSWORD" ]]; then
-  echo "ERROR: empty password"
+KEYRING_KEY="ereport_test8001"  # SQLcl conn name; reused as keyring username
+
+APEX_TEST_PASSWORD=$(./.venv/Scripts/python.exe -c "
+import sys, getpass, keyring
+SERVICE = 'apex-builder-mcp'
+key = '$KEYRING_KEY'
+pw = keyring.get_password(SERVICE, key)
+if pw is None:
+    sys.stderr.write(f'No saved password for {key}; prompting once...\n')
+    pw = getpass.getpass(f'Password for {key} (will be saved to Win Cred Mgr): ')
+    if not pw:
+        sys.stderr.write('Empty password\n')
+        sys.exit(1)
+    keyring.set_password(SERVICE, key, pw)
+    sys.stderr.write(f'Saved to keyring (apex-builder-mcp:{key})\n')
+sys.stdout.write(pw)
+")
+PW_RC=$?
+if [[ $PW_RC -ne 0 || -z "$APEX_TEST_PASSWORD" ]]; then
+  echo "ERROR: could not resolve password (rc=$PW_RC)"
   exit 1
 fi
 export APEX_TEST_PASSWORD
