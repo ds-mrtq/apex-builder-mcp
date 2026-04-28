@@ -4,14 +4,27 @@ from __future__ import annotations
 import pytest
 
 
-def pytest_collection_modifyitems(config, items):
-    """Skip integration tests unless --integration flag passed."""
-    if config.getoption("-m") and "integration" in config.getoption("-m"):
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add --integration CLI flag."""
+    parser.addoption(
+        "--integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests (need real DB DEV — slow).",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Skip tests marked `integration` unless --integration was passed."""
+    if config.getoption("--integration"):
         return
-    skip_integration = pytest.mark.skip(reason="run with -m integration")
+    skip = pytest.mark.skip(reason="needs --integration flag")
     for item in items:
         if "integration" in item.keywords:
-            item.add_marker(skip_integration)
+            item.add_marker(skip)
 
 
 @pytest.fixture

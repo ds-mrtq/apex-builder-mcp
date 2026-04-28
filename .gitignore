@@ -27,3 +27,8 @@ desktop.ini
 # IDEs
 .vscode/
 .idea/
+
+# Explicitly track the apex_builder_mcp.audit subpackage even if a stray
+# audit/ directory shows up at any depth (defense in depth)
+!src/apex_builder_mcp/audit/
+!src/apex_builder_mcp/audit/**
