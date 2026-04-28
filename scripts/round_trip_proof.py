@@ -1,146 +1,199 @@
-"""Phase 0 Gate 5 — Round-Trip Proof harness.
+"""Phase 0 Gate 5 — Round-Trip Proof harness (SQLcl-based, no password needed).
 
-Steps:
-1. Create sandbox app via wwv_flow_imp + wwv_flow_imp_page calls
-2. Add 1 page + 1 region + 1 item via internal API
-3. Export the app via APEX public API (apex_export.get_application)
-4. Drop sandbox + re-import the export into a fresh sandbox app id
-5. Compare metadata: page count, region count, item count
-6. Open the page in App Builder runtime URL and verify HTTP 200
-7. Cleanup both sandboxes
-8. Print PASS/FAIL summary + write JSON report
-
-Run: python scripts/round_trip_proof.py
+Uses `sql -name <conn>` subprocess for all DB ops. SQLcl resolves password
+from its own encrypted store — same UX as SQLcl MCP.
 
 Required env vars:
-    APEX_TEST_DSN              e.g., ebstest.vicemhatien.vn:1522/TEST1
-    APEX_TEST_USER             schema user (must have grants on wwv_flow_imp_page,
-                               wwv_flow_imp, wwv_flow_application_install, apex_export)
-    APEX_TEST_PASSWORD         (set locally only; never commit/log)
-    APEX_TEST_WORKSPACE_ID     numeric APEX workspace id (query from
-                               apex_workspaces if unsure)
-    APEX_TEST_SCHEMA           schema that owns the sandbox app (e.g., EREPORT)
-    APEX_TEST_RUNTIME_URL      e.g., http://ebstest.vicemhatien.vn:8001/ords/r/<workspace>
+    APEX_TEST_SQLCL_NAME       SQLcl named connection (e.g., ereport_test8001)
+    APEX_TEST_WORKSPACE        APEX workspace name (e.g., EREPORT)
+    APEX_TEST_SCHEMA           Schema that owns sandbox apps (e.g., EREPORT)
+    APEX_TEST_RUNTIME_URL      e.g., https://apexdev.vicemhatien.com.vn/ords/r/ereport
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import secrets
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
-import oracledb
+
+def _sqlcl(conn_name: str, sql_text: str, *, timeout: int = 120) -> tuple[int, str, str]:
+    """Run SQL/PLSQL via `sql -name <conn>`. Return (rc, stdout, stderr)."""
+    env = {**os.environ, "MSYS2_ARG_CONV_EXCL": "*"}
+    proc = subprocess.run(
+        ["sql", "-name", conn_name],
+        input=sql_text,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
 
 
-def make_sandbox_app(conn, app_id: int, ws_id: int, schema: str) -> None:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        begin
-          wwv_flow_application_install.set_workspace_id(:ws);
-          wwv_flow_application_install.set_schema(:sc);
-          wwv_flow_application_install.set_application_id(:aid);
-          wwv_flow_application_install.generate_offset;
-          wwv_flow_imp.create_application(
-            p_id => :aid, p_owner => :sc,
-            p_name => '_TEST_APEXBLD_RT_' || :aid,
-            p_alias => '_RT_' || :aid,
-            p_application_group => 0
-          );
-          wwv_flow_imp_page.create_page(
-            p_id => 1, p_name => 'RT_Sandbox', p_step_title => 'RT_Sandbox'
-          );
-          wwv_flow_imp_page.create_page_plug(
-            p_id => 100, p_plug_name => 'RT_Region',
-            p_plug_template => 0, p_plug_display_sequence => 10,
-            p_plug_source_type => 'NATIVE_HTML',
-            p_plug_query_options => 'DERIVED_REPORT_COLUMNS'
-          );
-          wwv_flow_imp_page.create_page_item(
-            p_id => 200, p_name => 'P1_RT_ITEM',
-            p_item_sequence => 10, p_item_plug_id => 100,
-            p_display_as => 'NATIVE_TEXT_FIELD'
-          );
-          commit;
-        end;
-        """,
-        ws=ws_id, sc=schema, aid=app_id,
+def _strip_sqlcl_banner(out: str) -> str:
+    """Drop SQLcl banner / connect lines so we focus on actual results."""
+    lines = out.splitlines()
+    drop_patterns = [
+        r"^SQLcl: Release",
+        r"^Copyright \(c\)",
+        r"^Connected\.$",
+        r"^$",
+    ]
+    return "\n".join(
+        ln for ln in lines if not any(re.match(p, ln) for p in drop_patterns)
     )
 
 
-def export_app_via_public_api(conn, app_id: int, output_path: Path) -> None:
-    cur = conn.cursor()
-    clob_var = cur.var(oracledb.DB_TYPE_CLOB)
-    cur.execute(
-        """
-        declare
-          l_files apex_t_export_files;
-        begin
-          l_files := apex_export.get_application(p_application_id => :app_id);
-          :out := l_files(1).contents;
-        end;
-        """,
-        app_id=app_id,
-        out=clob_var,
-    )
-    output_path.write_text(clob_var.getvalue(), encoding="utf-8")
+def lookup_workspace_id(conn_name: str, workspace: str) -> int:
+    sql = f"""set heading off feedback off pagesize 0 echo off
+select workspace_id from apex_workspaces where upper(workspace) = '{workspace.upper()}';
+exit
+"""
+    rc, stdout, stderr = _sqlcl(conn_name, sql)
+    if rc != 0:
+        raise RuntimeError(f"workspace lookup failed rc={rc}: {stderr}")
+    # Extract numeric workspace_id
+    for line in _strip_sqlcl_banner(stdout).splitlines():
+        line = line.strip()
+        if line.isdigit():
+            return int(line)
+    raise RuntimeError(f"Could not parse workspace_id from output:\n{stdout}")
 
 
-def drop_app(conn, app_id: int) -> None:
-    cur = conn.cursor()
-    try:
-        cur.execute("begin wwv_flow_imp.remove_flow(:a); commit; end;", a=app_id)
-    except Exception as e:
-        print(f"WARN: drop_app({app_id}) failed: {e}")
+def make_sandbox_app(conn_name: str, app_id: int, ws_id: int, schema: str) -> None:
+    sql = f"""set echo off feedback off
+begin
+  wwv_flow_application_install.set_workspace_id({ws_id});
+  wwv_flow_application_install.set_schema('{schema}');
+  wwv_flow_application_install.set_application_id({app_id});
+  wwv_flow_application_install.generate_offset;
+  wwv_flow_imp.create_application(
+    p_id => {app_id}, p_owner => '{schema}',
+    p_name => '_TEST_APEXBLD_RT_' || {app_id},
+    p_alias => '_RT_' || {app_id},
+    p_application_group => 0
+  );
+  wwv_flow_imp_page.create_page(
+    p_id => 1, p_name => 'RT_Sandbox', p_step_title => 'RT_Sandbox'
+  );
+  wwv_flow_imp_page.create_page_plug(
+    p_id => 100, p_plug_name => 'RT_Region',
+    p_plug_template => 0, p_plug_display_sequence => 10,
+    p_plug_source_type => 'NATIVE_HTML',
+    p_plug_query_options => 'DERIVED_REPORT_COLUMNS'
+  );
+  wwv_flow_imp_page.create_page_item(
+    p_id => 200, p_name => 'P1_RT_ITEM',
+    p_item_sequence => 10, p_item_plug_id => 100,
+    p_display_as => 'NATIVE_TEXT_FIELD'
+  );
+  commit;
+end;
+/
+exit
+"""
+    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=180)
+    out = _strip_sqlcl_banner(stdout)
+    if rc != 0 or "ORA-" in out or "PLS-" in out:
+        raise RuntimeError(
+            f"create sandbox failed rc={rc}\nstdout:\n{out}\nstderr:\n{stderr}"
+        )
 
 
-def reimport_app(conn, export_file: Path, new_app_id: int, ws_id: int, schema: str) -> None:
-    sql_text = export_file.read_text(encoding="utf-8")
-    cur = conn.cursor()
-    cur.execute(
-        """
-        begin
-          wwv_flow_application_install.set_workspace_id(:ws);
-          wwv_flow_application_install.set_schema(:sc);
-          wwv_flow_application_install.set_application_id(:aid);
-          wwv_flow_application_install.generate_offset;
-        end;
-        """,
-        ws=ws_id, sc=schema, aid=new_app_id,
-    )
-    cur.execute(sql_text)
-    conn.commit()
+def export_app(conn_name: str, app_id: int, output_dir: Path) -> Path:
+    """Use SQLcl's `apex export` command. Returns path of generated .sql."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # apex export -applicationid <id> -dir <dir> writes f<id>.sql
+    sql = f"""apex export -applicationid {app_id} -dir {output_dir.as_posix()}
+exit
+"""
+    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=180)
+    out = _strip_sqlcl_banner(stdout)
+    if rc != 0:
+        raise RuntimeError(f"export failed rc={rc}\n{out}\nerr:\n{stderr}")
+    expected = output_dir / f"f{app_id}.sql"
+    if not expected.exists():
+        # SQLcl 26 may use different naming — find any .sql in output_dir
+        candidates = list(output_dir.glob("*.sql"))
+        if not candidates:
+            raise RuntimeError(f"export produced no .sql file in {output_dir}\n{out}")
+        return candidates[0]
+    return expected
 
 
-def metadata_for_app(conn, app_id: int) -> dict:
-    cur = conn.cursor()
-    cur.execute(
-        "select pages from apex_applications where application_id = :a",
-        a=app_id,
-    )
-    page_count = cur.fetchone()[0]
-    cur.execute(
-        "select count(*) from apex_application_page_regions where application_id = :a",
-        a=app_id,
-    )
-    region_count = cur.fetchone()[0]
-    cur.execute(
-        "select count(*) from apex_application_page_items where application_id = :a",
-        a=app_id,
-    )
-    item_count = cur.fetchone()[0]
-    return {"pages": page_count, "regions": region_count, "items": item_count}
+def drop_app(conn_name: str, app_id: int) -> None:
+    sql = f"""set echo off feedback off
+begin
+  begin
+    wwv_flow_imp.remove_flow({app_id});
+  exception when others then null;
+  end;
+  commit;
+end;
+/
+exit
+"""
+    _sqlcl(conn_name, sql, timeout=60)
+
+
+def reimport_app(
+    conn_name: str,
+    export_file: Path,
+    new_app_id: int,
+    ws_id: int,
+    schema: str,
+) -> None:
+    # Set offset + workspace + new app id, then run the export script
+    sql = f"""set echo off feedback off
+begin
+  wwv_flow_application_install.set_workspace_id({ws_id});
+  wwv_flow_application_install.set_schema('{schema}');
+  wwv_flow_application_install.set_application_id({new_app_id});
+  wwv_flow_application_install.generate_offset;
+end;
+/
+@{export_file.as_posix()}
+exit
+"""
+    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=300)
+    out = _strip_sqlcl_banner(stdout)
+    if rc != 0 or "ORA-" in out or "PLS-" in out:
+        raise RuntimeError(
+            f"reimport failed rc={rc}\nstdout:\n{out}\nstderr:\n{stderr}"
+        )
+
+
+def metadata_for_app(conn_name: str, app_id: int) -> dict:
+    sql = f"""set heading off feedback off pagesize 0 echo off
+select pages from apex_applications where application_id = {app_id};
+select count(*) from apex_application_page_regions where application_id = {app_id};
+select count(*) from apex_application_page_items where application_id = {app_id};
+exit
+"""
+    rc, stdout, _ = _sqlcl(conn_name, sql)
+    if rc != 0:
+        raise RuntimeError(f"metadata query failed rc={rc}\n{stdout}")
+    nums = [
+        int(line.strip())
+        for line in _strip_sqlcl_banner(stdout).splitlines()
+        if line.strip().isdigit()
+    ]
+    if len(nums) < 3:
+        raise RuntimeError(f"could not parse 3 metadata numbers from:\n{stdout}")
+    return {"pages": nums[0], "regions": nums[1], "items": nums[2]}
 
 
 def verify_runtime_page_open(
     runtime_url: str, app_alias: str, page_id: int = 1
 ) -> tuple[bool, str]:
-    """GET the page; verify HTTP 200 and no error markers. Returns (ok, info_string)."""
     url = f"{runtime_url.rstrip('/')}/{app_alias}/{page_id}"
     try:
         with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
@@ -156,7 +209,7 @@ def verify_runtime_page_open(
             ]
             for marker in error_markers:
                 if marker in html:
-                    return (False, f"Found error marker '{marker}' in response")
+                    return (False, f"error marker '{marker}' in response")
             return (True, "HTTP 200, no error markers")
     except urllib.error.HTTPError as e:
         return (False, f"HTTPError {e.code}: {e.reason}")
@@ -169,102 +222,114 @@ def main() -> int:
     parser.add_argument("--report", type=Path, default=Path("docs/PHASE_0_REPORT.md"))
     args = parser.parse_args()
 
-    required_vars = [
-        "APEX_TEST_DSN", "APEX_TEST_USER", "APEX_TEST_PASSWORD",
-        "APEX_TEST_WORKSPACE_ID", "APEX_TEST_SCHEMA", "APEX_TEST_RUNTIME_URL",
+    required = [
+        "APEX_TEST_SQLCL_NAME",
+        "APEX_TEST_WORKSPACE",
+        "APEX_TEST_SCHEMA",
+        "APEX_TEST_RUNTIME_URL",
     ]
-    missing = [v for v in required_vars if not os.environ.get(v)]
+    missing = [v for v in required if not os.environ.get(v)]
     if missing:
         print(f"ERROR: missing env vars: {missing}", file=sys.stderr)
         return 2
 
-    dsn = os.environ["APEX_TEST_DSN"]
-    user = os.environ["APEX_TEST_USER"]
-    pw = os.environ["APEX_TEST_PASSWORD"]
-    ws_id = int(os.environ["APEX_TEST_WORKSPACE_ID"])
+    conn = os.environ["APEX_TEST_SQLCL_NAME"]
+    workspace = os.environ["APEX_TEST_WORKSPACE"]
     schema = os.environ["APEX_TEST_SCHEMA"]
     runtime_url = os.environ["APEX_TEST_RUNTIME_URL"]
 
     rid = 800000 + secrets.randbelow(99999)
     rid2 = rid + 100
-    conn = oracledb.connect(user=user, password=pw, dsn=dsn)
+
     findings: dict = {
         "timestamp": datetime.now(UTC).isoformat(),
-        "test_dsn": dsn.split("@")[-1] if "@" in dsn else dsn,  # don't log creds
-        "test_user": user,
-        "workspace_id": ws_id,
+        "sqlcl_conn": conn,
+        "workspace": workspace,
+        "schema": schema,
         "steps": [],
     }
     overall_pass = True
 
     try:
+        ws_id = lookup_workspace_id(conn, workspace)
+        findings["workspace_id"] = ws_id
+        print(f"[Lookup] workspace {workspace} → ID {ws_id}")
+
         print(f"[1/6] Create sandbox app {rid}")
         make_sandbox_app(conn, rid, ws_id, schema)
         meta_a = metadata_for_app(conn, rid)
-        findings["steps"].append({
-            "step": "create_sandbox",
-            "app_id": rid,
-            "metadata": meta_a,
-            "status": "ok",
-        })
+        findings["steps"].append(
+            {"step": "create_sandbox", "app_id": rid, "metadata": meta_a, "status": "ok"}
+        )
 
-        print(f"[2/6] Export app {rid}")
-        # Use cross-platform tmp dir
-        export_path = Path(os.environ.get("TEMP", "/tmp")) / f"apex_rt_{rid}.sql"
-        export_app_via_public_api(conn, rid, export_path)
-        findings["steps"].append({
-            "step": "export",
-            "size_bytes": export_path.stat().st_size,
-            "path": str(export_path),
-            "status": "ok",
-        })
+        print(f"[2/6] Export app {rid} via `apex export`")
+        export_dir = Path(os.environ.get("TEMP", "/tmp")) / f"apex_rt_{rid}"
+        export_file = export_app(conn, rid, export_dir)
+        findings["steps"].append(
+            {
+                "step": "export",
+                "size_bytes": export_file.stat().st_size,
+                "path": str(export_file),
+                "status": "ok",
+            }
+        )
 
         print(f"[3/6] Drop sandbox {rid}")
         drop_app(conn, rid)
         findings["steps"].append({"step": "drop_sandbox", "app_id": rid, "status": "ok"})
 
         print(f"[4/6] Re-import as app {rid2}")
-        reimport_app(conn, export_path, rid2, ws_id, schema)
+        reimport_app(conn, export_file, rid2, ws_id, schema)
         meta_b = metadata_for_app(conn, rid2)
-        findings["steps"].append({
-            "step": "reimport", "app_id": rid2, "metadata": meta_b, "status": "ok"
-        })
+        findings["steps"].append(
+            {"step": "reimport", "app_id": rid2, "metadata": meta_b, "status": "ok"}
+        )
 
         print("[5/6] Compare metadata")
         if meta_a != meta_b:
-            findings["steps"].append({
-                "step": "metadata_match", "status": "fail",
-                "before": meta_a, "after": meta_b,
-            })
+            findings["steps"].append(
+                {
+                    "step": "metadata_match",
+                    "status": "fail",
+                    "before": meta_a,
+                    "after": meta_b,
+                }
+            )
             overall_pass = False
-            print(f"  FAIL — metadata mismatch: {meta_a} vs {meta_b}")
+            print(f"  FAIL — mismatch: {meta_a} vs {meta_b}")
         else:
             findings["steps"].append({"step": "metadata_match", "status": "ok"})
             print("  PASS — metadata identity")
 
-        print(f"[6/6] Verify runtime page open (app_alias=_RT_{rid2}, page=1)")
-        runtime_ok, runtime_info = verify_runtime_page_open(runtime_url, f"_RT_{rid2}", 1)
-        if not runtime_ok:
-            findings["steps"].append({
-                "step": "runtime_open", "status": "fail", "detail": runtime_info,
-            })
+        print(f"[6/6] Verify runtime page open (alias=_RT_{rid2}, page=1)")
+        ok, info = verify_runtime_page_open(runtime_url, f"_RT_{rid2}", 1)
+        findings["steps"].append(
+            {"step": "runtime_open", "status": "ok" if ok else "fail", "detail": info}
+        )
+        if not ok:
             overall_pass = False
-            print(f"  FAIL — {runtime_info}")
+            print(f"  FAIL — {info}")
         else:
-            findings["steps"].append({
-                "step": "runtime_open", "status": "ok", "detail": runtime_info,
-            })
-            print(f"  PASS — {runtime_info}")
+            print(f"  PASS — {info}")
+    except Exception as e:
+        findings["steps"].append({"step": "exception", "status": "fail", "detail": str(e)})
+        overall_pass = False
+        print(f"\nERROR: {e}", file=sys.stderr)
     finally:
-        drop_app(conn, rid)
-        drop_app(conn, rid2)
-        conn.close()
+        try:
+            drop_app(conn, rid)
+        except Exception:
+            pass
+        try:
+            drop_app(conn, rid2)
+        except Exception:
+            pass
 
     findings["overall"] = "PASS" if overall_pass else "FAIL"
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("a", encoding="utf-8") as fh:
-        fh.write("\n\n## Gate 5 Round-Trip Proof Findings\n\n")
+        fh.write("\n\n## Gate 5 Round-Trip Proof Findings (SQLcl-based)\n\n")
         fh.write("```json\n")
         fh.write(json.dumps(findings, indent=2, ensure_ascii=False))
         fh.write("\n```\n")

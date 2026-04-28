@@ -1,109 +1,130 @@
 #!/bin/bash
-# Phase 0 Gates 2 + 5 runner — apex-builder-mcp
+# Phase 0 Gates 2 + 5 runner — uses SQLcl saved connection (no password).
 #
-# Run from Git Bash on Windows. Prompts for DB password (silent), looks up
-# the APEX workspace_id, then runs Gate 2 (5 sample WWV calls) and Gate 5
-# (round-trip proof — the deciding gate).
+# Same UX as SQLcl MCP: SQLcl resolves password from its own encrypted store.
+# We never see the password. Run from Git Bash on Windows.
 #
 # Usage:
 #   cd /d/repos/apex-builder-mcp
 #   ./scripts/run_phase_0_gates.sh
-#
-# Gate 2 + 5 results land in docs/PHASE_0_REPORT.md (Gate 5 appends JSON
-# findings). Manual interpretation needed afterwards.
 
 set -u
 
 cd "$(dirname "$0")/.." || { echo "Cannot cd into repo root"; exit 2; }
+export MSYS2_ARG_CONV_EXCL='*'
 
-# ----------------------------------------------------------------------------
-# Resolve password via keyring (Win Cred Mgr) — prompt only on first run
-# ----------------------------------------------------------------------------
-KEYRING_KEY="ereport_test8001"  # SQLcl conn name; reused as keyring username
-
-APEX_TEST_PASSWORD=$(./.venv/Scripts/python.exe -c "
-import sys, getpass, keyring
-SERVICE = 'apex-builder-mcp'
-key = '$KEYRING_KEY'
-pw = keyring.get_password(SERVICE, key)
-if pw is None:
-    sys.stderr.write(f'No saved password for {key}; prompting once...\n')
-    pw = getpass.getpass(f'Password for {key} (will be saved to Win Cred Mgr): ')
-    if not pw:
-        sys.stderr.write('Empty password\n')
-        sys.exit(1)
-    keyring.set_password(SERVICE, key, pw)
-    sys.stderr.write(f'Saved to keyring (apex-builder-mcp:{key})\n')
-sys.stdout.write(pw)
-")
-PW_RC=$?
-if [[ $PW_RC -ne 0 || -z "$APEX_TEST_PASSWORD" ]]; then
-  echo "ERROR: could not resolve password (rc=$PW_RC)"
-  exit 1
-fi
-export APEX_TEST_PASSWORD
-
-# ----------------------------------------------------------------------------
-# Static env vars — TEST env, EREPORT schema/workspace
-# (no secrets here; safe to commit)
-# ----------------------------------------------------------------------------
-export APEX_TEST_DSN="ebstest.vicemhatien.vn:1522/TEST1"
-export APEX_TEST_USER="ereport"
-export APEX_TEST_SCHEMA="EREPORT"
+# Static config — SQLcl saved connection name, workspace, schema, runtime URL
 export APEX_TEST_SQLCL_NAME="ereport_test8001"
-# APEX runtime URL — workspace 'EREPORT' lowercased to ORDS path:
+export APEX_TEST_WORKSPACE="EREPORT"
+export APEX_TEST_SCHEMA="EREPORT"
 export APEX_TEST_RUNTIME_URL="https://apexdev.vicemhatien.com.vn/ords/r/ereport"
 
 # ----------------------------------------------------------------------------
-# Lookup workspace_id from DB
+# Pre-flight: verify SQLcl can connect using saved password
 # ----------------------------------------------------------------------------
-echo
-echo "[1/3] Looking up APEX workspace_id for 'EREPORT'..."
-WORKSPACE_ID=$(./.venv/Scripts/python.exe -c "
-import os, sys, oracledb
-try:
-    conn = oracledb.connect(
-        user=os.environ['APEX_TEST_USER'],
-        password=os.environ['APEX_TEST_PASSWORD'],
-        dsn=os.environ['APEX_TEST_DSN'],
-    )
-    cur = conn.cursor()
-    cur.execute(
-        \"select workspace_id from apex_workspaces where upper(workspace) = 'EREPORT'\"
-    )
-    row = cur.fetchone()
-    if row is None:
-        sys.stderr.write('Workspace EREPORT not found in apex_workspaces\n')
-        sys.exit(2)
-    print(int(row[0]))
-    conn.close()
-except oracledb.DatabaseError as e:
-    sys.stderr.write(f'DB error: {e}\n')
-    sys.exit(3)
-" 2>&1)
-
-LOOKUP_RC=$?
-if [[ $LOOKUP_RC -ne 0 ]]; then
-  echo "ERROR: workspace lookup failed (rc=$LOOKUP_RC):"
-  echo "$WORKSPACE_ID"
-  unset APEX_TEST_PASSWORD
+echo "[1/3] Verifying SQLcl connection $APEX_TEST_SQLCL_NAME..."
+PRECHECK=$(printf "set heading off feedback off pagesize 0\nselect 'OK_CHK' from dual;\nexit\n" \
+    | sql -name "$APEX_TEST_SQLCL_NAME" 2>&1)
+if ! echo "$PRECHECK" | grep -q "OK_CHK"; then
+  echo "ERROR: cannot connect via 'sql -name $APEX_TEST_SQLCL_NAME'. Output:"
+  echo "$PRECHECK"
   exit 1
 fi
-export APEX_TEST_WORKSPACE_ID="$WORKSPACE_ID"
-echo "    Workspace ID: $WORKSPACE_ID"
+echo "    OK"
 
 # ----------------------------------------------------------------------------
-# Gate 2: 5 sample WWV_FLOW_IMP_PAGE calls
+# Gate 2: 5 sample WWV_FLOW_IMP_PAGE calls (PL/SQL via SQLcl)
 # ----------------------------------------------------------------------------
 echo
 echo "============================================================"
 echo "[2/3] Gate 2: 5 sample WWV_FLOW_IMP_PAGE calls"
 echo "============================================================"
-./.venv/Scripts/pytest.exe tests/integration/test_wwv_calls_real.py -v --integration -s
-GATE2_RC=$?
+
+# Lookup workspace_id
+WS_ID=$(printf "set heading off feedback off pagesize 0\nselect workspace_id from apex_workspaces where upper(workspace) = '%s';\nexit\n" \
+    "$APEX_TEST_WORKSPACE" | sql -name "$APEX_TEST_SQLCL_NAME" 2>&1 \
+    | grep -E '^[ ]*[0-9]+[ ]*$' | head -1 | tr -d ' ')
+if [[ -z "$WS_ID" ]]; then
+  echo "ERROR: could not lookup workspace_id for $APEX_TEST_WORKSPACE"
+  exit 1
+fi
+echo "    Workspace $APEX_TEST_WORKSPACE → ID $WS_ID"
+
+SBOX_ID=$((900000 + RANDOM % 99999))
+echo "    Sandbox app id: $SBOX_ID"
+
+GATE2_OUT=$(sql -name "$APEX_TEST_SQLCL_NAME" 2>&1 <<EOF
+set echo on feedback on
+begin
+  wwv_flow_application_install.set_workspace_id($WS_ID);
+  wwv_flow_application_install.set_schema('$APEX_TEST_SCHEMA');
+  wwv_flow_application_install.set_application_id($SBOX_ID);
+  wwv_flow_application_install.generate_offset;
+  wwv_flow_imp.create_application(
+    p_id => $SBOX_ID,
+    p_owner => '$APEX_TEST_SCHEMA',
+    p_name => '_TEST_APEXBLD_' || $SBOX_ID,
+    p_alias => '_TST_' || $SBOX_ID,
+    p_application_group => 0
+  );
+  wwv_flow_imp_page.create_page(
+    p_id => 1, p_name => 'Sandbox', p_step_title => 'Sandbox'
+  );
+  wwv_flow_imp_page.create_page_plug(
+    p_id => 100, p_plug_name => 'TestRegion',
+    p_plug_template => 0, p_plug_display_sequence => 10,
+    p_plug_source_type => 'NATIVE_HTML',
+    p_plug_query_options => 'DERIVED_REPORT_COLUMNS'
+  );
+  wwv_flow_imp_page.create_page_item(
+    p_id => 200, p_name => 'P1_TEST',
+    p_item_sequence => 10, p_item_plug_id => 100,
+    p_display_as => 'NATIVE_TEXT_FIELD'
+  );
+  wwv_flow_imp_page.create_page_button(
+    p_id => 300, p_button_sequence => 10, p_button_plug_id => 100,
+    p_button_name => 'BTN_OK', p_button_action => 'SUBMIT',
+    p_button_template_id => 0, p_button_image_alt => 'OK'
+  );
+  wwv_flow_imp_page.create_page_process(
+    p_id => 400, p_process_sequence => 10, p_process_type => 'NATIVE_PLSQL',
+    p_process_name => 'PROC_TEST', p_process_sql_clob => 'null;'
+  );
+  commit;
+end;
+/
+prompt --- region count check ---
+select count(*) as region_count
+  from apex_application_page_regions where application_id = $SBOX_ID;
+prompt --- cleanup ---
+begin
+  begin wwv_flow_imp.remove_flow($SBOX_ID); exception when others then null; end;
+  commit;
+end;
+/
+exit
+EOF
+)
+
+echo "$GATE2_OUT"
+
+# Gate 2 passes iff: no ORA-, no PLS-, region_count >= 1
+if echo "$GATE2_OUT" | grep -qE "(ORA-[0-9]+|PLS-[0-9]+)"; then
+  echo
+  echo "Gate 2: FAIL — ORA/PLS error detected in output"
+  GATE2_RC=1
+elif echo "$GATE2_OUT" | grep -qE "region_count[^0-9]+[1-9]" ; then
+  echo
+  echo "Gate 2: PASS — 5 calls succeeded, region_count >= 1"
+  GATE2_RC=0
+else
+  echo
+  echo "Gate 2: FAIL — could not confirm region_count from output"
+  GATE2_RC=1
+fi
 
 # ----------------------------------------------------------------------------
-# Gate 5: Round-Trip Proof
+# Gate 5: Round-Trip Proof (Python harness, also via SQLcl)
 # ----------------------------------------------------------------------------
 echo
 echo "============================================================"
@@ -113,34 +134,20 @@ echo "============================================================"
 GATE5_RC=$?
 
 # ----------------------------------------------------------------------------
-# Clear sensitive env
-# ----------------------------------------------------------------------------
-unset APEX_TEST_PASSWORD
-
-# ----------------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------------
 echo
 echo "============================================================"
 echo "Phase 0 Gates Summary"
 echo "============================================================"
-if [[ $GATE2_RC -eq 0 ]]; then
-  echo "Gate 2: PASS (5 WWV calls succeeded)"
-else
-  echo "Gate 2: FAIL (rc=$GATE2_RC)"
-fi
-if [[ $GATE5_RC -eq 0 ]]; then
-  echo "Gate 5: PASS (round-trip proof succeeded)"
-else
-  echo "Gate 5: FAIL (rc=$GATE5_RC) — see docs/PHASE_0_REPORT.md for findings"
-fi
-
+[[ $GATE2_RC -eq 0 ]] && echo "Gate 2: PASS" || echo "Gate 2: FAIL (rc=$GATE2_RC)"
+[[ $GATE5_RC -eq 0 ]] && echo "Gate 5: PASS" || echo "Gate 5: FAIL (rc=$GATE5_RC)"
 echo
 echo "Per spec auto-pivot rule:"
 if [[ $GATE2_RC -eq 0 && $GATE5_RC -eq 0 ]]; then
-  echo "  Both PASS -> proceed to Plan 2A: Direct-Write MVP"
+  echo "  Both PASS → proceed to Plan 2A: Direct-Write MVP"
   exit 0
 else
-  echo "  Any FAIL -> proceed to Plan 2B: File-Based Pivot MVP"
+  echo "  Any FAIL → proceed to Plan 2B: File-Based Pivot MVP"
   exit 1
 fi
