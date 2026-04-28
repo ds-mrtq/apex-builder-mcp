@@ -18,3 +18,12 @@ env/
 .env
 *.log
 audit/
+
+# Windows
+Thumbs.db
+desktop.ini
+*.pyd
+
+# IDEs
+.vscode/
+.idea/
