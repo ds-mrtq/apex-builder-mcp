@@ -24,9 +24,12 @@ class ApexBuilderPool:
         return self._pool is not None
 
     def connect(self, profile: Profile, dsn: str, user: str, password: str) -> None:
+        # Clear any existing pool first; if create_pool fails below, state stays None
         if self._pool is not None:
             self._pool.close()
-        self._pool = oracledb.create_pool(
+            self._pool = None
+            self._profile = None
+        new_pool = oracledb.create_pool(
             user=user,
             password=password,
             dsn=dsn,
@@ -35,6 +38,8 @@ class ApexBuilderPool:
             increment=1,
             getmode=oracledb.POOL_GETMODE_WAIT,
         )
+        # Only assign on success
+        self._pool = new_pool
         self._profile = profile
 
     def disconnect(self) -> None:

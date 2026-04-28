@@ -8,7 +8,7 @@ import pytest
 
 from apex_builder_mcp.connection.sqlcl_metadata import (
     SqlclConnectionMetadata,
-    SqlclConnectionNotFound,
+    SqlclConnectionNotFoundError,
     read_connection_metadata,
 )
 
@@ -48,7 +48,7 @@ def test_read_known_connection(fake_connections_file):
 
 
 def test_read_unknown_connection_raises(fake_connections_file):
-    with pytest.raises(SqlclConnectionNotFound):
+    with pytest.raises(SqlclConnectionNotFoundError):
         read_connection_metadata("NOPE", connections_file=fake_connections_file)
 
 
@@ -61,3 +61,15 @@ def test_does_not_expose_password_field(fake_connections_file):
     md = read_connection_metadata("HTC_DEV1", connections_file=fake_connections_file)
     # explicit guard: ensure no password-like attribute exposed
     assert not hasattr(md, "password")
+
+
+def test_naming_consistency_with_profile_not_found_error():
+    """Both 'not found' errors in connection module must follow the *Error suffix convention."""
+    from apex_builder_mcp.connection.profile import ProfileNotFoundError
+    from apex_builder_mcp.connection.sqlcl_metadata import SqlclConnectionNotFoundError
+
+    # Both are KeyError subclasses with consistent naming
+    assert issubclass(ProfileNotFoundError, KeyError)
+    assert issubclass(SqlclConnectionNotFoundError, KeyError)
+    assert ProfileNotFoundError.__name__.endswith("Error")
+    assert SqlclConnectionNotFoundError.__name__.endswith("Error")

@@ -49,3 +49,30 @@ def test_pool_disconnect(monkeypatch):
     p.disconnect()
     assert not p.is_connected
     fake_pool.close.assert_called_once()
+
+
+def test_pool_reconnect_failure_clears_stale_state(monkeypatch):
+    """If create_pool raises during reconnect, state must be cleared (no stale pool)."""
+    fake_pool_first = MagicMock()
+    fake_oracledb = MagicMock()
+    fake_oracledb.create_pool = MagicMock(return_value=fake_pool_first)
+    monkeypatch.setattr("apex_builder_mcp.connection.pool.oracledb", fake_oracledb)
+
+    # First connect succeeds
+    p = ApexBuilderPool()
+    p.connect(profile=make_profile(), dsn="x", user="u", password="p")
+    assert p.is_connected
+
+    # Second connect: create_pool raises (simulate auth failure / network down)
+    fake_oracledb.create_pool = MagicMock(
+        side_effect=Exception("ORA-01017: invalid username/password")
+    )
+
+    with pytest.raises(Exception, match="ORA-01017"):
+        p.connect(profile=make_profile(), dsn="y", user="u", password="bad")
+
+    # After failure: pool must be cleared (not stale)
+    assert not p.is_connected
+    assert p.profile is None
+    # Old pool should have been closed during the cleanup
+    fake_pool_first.close.assert_called_once()

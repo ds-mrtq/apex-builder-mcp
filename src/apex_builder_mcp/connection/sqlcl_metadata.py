@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-class SqlclConnectionNotFound(KeyError):  # noqa: N818
+class SqlclConnectionNotFoundError(KeyError):
     """Connection name not found in SQLcl/SQL Developer connections store."""
 
 
@@ -56,4 +56,4 @@ def read_connection_metadata(
                 service_name=conn["serviceName"],
                 user=conn["user"],
             )
-    raise SqlclConnectionNotFound(name)
+    raise SqlclConnectionNotFoundError(name)
