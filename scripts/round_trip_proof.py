@@ -114,12 +114,26 @@ exit
 
 
 def add_probe_to_app(conn_name: str, app_id: int, ws_id: int, schema: str) -> None:
-    """Add probe page+region+item via wwv_flow_imp_page.create_* (MVP write path)."""
-    sql = f"""set echo off feedback on
+    """Add probe page+region+item via APEX import session pattern.
+
+    wwv_flow_imp_page.create_* requires import session context (sets
+    g_security_group_id and other globals). Wrap calls in
+    wwv_flow_imp.import_begin / import_end per APEX 24.2.12 export format.
+    """
+    sql = f"""set echo off feedback on define off verify off
+whenever sqlerror exit sql.sqlcode rollback
 begin
-  wwv_flow_application_install.set_workspace_id({ws_id});
-  wwv_flow_application_install.set_schema('{schema}');
-  wwv_flow_application_install.set_application_id({app_id});
+  wwv_flow_imp.import_begin(
+    p_version_yyyy_mm_dd => '2024.11.30',
+    p_release => '24.2.12',
+    p_default_workspace_id => {ws_id},
+    p_default_application_id => {app_id},
+    p_default_id_offset => 0,
+    p_default_owner => '{schema}'
+  );
+end;
+/
+begin
   wwv_flow_imp_page.create_page(
     p_id => {PROBE_PAGE_ID},
     p_name => '{PROBE_NAME}',
@@ -140,6 +154,12 @@ begin
     p_item_plug_id => {PROBE_REGION_ID},
     p_display_as => 'NATIVE_TEXT_FIELD'
   );
+end;
+/
+begin
+  wwv_flow_imp.import_end(
+    p_auto_install_sup_obj => nvl(wwv_flow_application_install.get_auto_install_sup_obj, false)
+  );
   commit;
 end;
 /
@@ -152,13 +172,30 @@ exit
         )
 
 
-def remove_probe_from_app(conn_name: str, app_id: int) -> None:
-    """Delete probe page via wwv_flow_imp_page.remove_page."""
-    sql = f"""set echo off feedback off
+def remove_probe_from_app(conn_name: str, app_id: int, ws_id: int, schema: str) -> None:
+    """Delete probe page via wwv_flow_imp_page.remove_page (also needs import session)."""
+    sql = f"""set echo off feedback off define off verify off
+begin
+  wwv_flow_imp.import_begin(
+    p_version_yyyy_mm_dd => '2024.11.30',
+    p_release => '24.2.12',
+    p_default_workspace_id => {ws_id},
+    p_default_application_id => {app_id},
+    p_default_id_offset => 0,
+    p_default_owner => '{schema}'
+  );
+end;
+/
 begin
   wwv_flow_imp_page.remove_page(
     p_flow_id => {app_id},
     p_page_id => {PROBE_PAGE_ID}
+  );
+end;
+/
+begin
+  wwv_flow_imp.import_end(
+    p_auto_install_sup_obj => nvl(wwv_flow_application_install.get_auto_install_sup_obj, false)
   );
   commit;
 end;
@@ -242,6 +279,7 @@ def main() -> int:
     }
     overall_pass = True
     probe_added = False
+    ws_id = 0  # set in try; referenced in finally cleanup
 
     try:
         ws_id = lookup_workspace_id(conn, workspace)
@@ -327,7 +365,7 @@ def main() -> int:
             print(f"    FAIL - {info}")
 
         print("[6/7] Cleanup: remove probe page via wwv_flow_imp_page.remove_page")
-        remove_probe_from_app(conn, app_id)
+        remove_probe_from_app(conn, app_id, ws_id, schema)
         probe_added = False
         meta_after_remove = metadata_for_app(conn, app_id)
         if meta_after_remove["pages"] != meta_before["pages"]:
@@ -377,7 +415,7 @@ def main() -> int:
         # Defensive cleanup if probe was added but step 6 didn't run
         if probe_added:
             try:
-                remove_probe_from_app(conn, app_id)
+                remove_probe_from_app(conn, app_id, ws_id, schema)
                 findings["cleanup"] = "probe removed in finally"
                 print("\n[finally] probe removed via finally clause", file=sys.stderr)
             except Exception as e:
