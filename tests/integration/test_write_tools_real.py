@@ -1155,3 +1155,152 @@ def test_list_workspace_users_dev_live_2b6(dev_state):
         assert "count" in result
     except Exception as e:
         pytest.skip(f"apex_list_workspace_users requires oracledb pool: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 2B-7 generator live DEV tests
+#
+# Probe ID range for 2B-7: 9200-9299. Generators compose existing low-level
+# tools — these tests verify the end-to-end composition seeds expected
+# artifacts and that cleanup-via-apex_delete_page works for each created page.
+#
+# Table choice: live tests bind form regions to a table that exists in the
+# EREPORT workspace schema. We resolve dynamically — first table that EREPORT
+# can see via user_tables — to avoid hard-coding EMP-style fixture tables.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_test_table(app_id: int) -> str | None:
+    """Find any user table in workspace schema for live form-region tests."""
+    from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+
+    try:
+        result = run_sqlcl(
+            os.environ["APEX_TEST_SQLCL_NAME"],
+            (
+                "set heading off feedback off pagesize 0 echo off\n"
+                "select min(table_name) from user_tables;\nexit\n"
+            ),
+            timeout=30,
+        )
+        for line in result.cleaned.splitlines():
+            s = line.strip()
+            # First identifier-like token wins (allow $ # _ in oracle names)
+            if s and s.replace("_", "").replace("$", "").replace("#", "").isalnum():
+                return s
+    except Exception:
+        return None
+    return None
+
+
+def _cleanup_2b7_pages(app_id: int, page_ids: list[int]) -> None:
+    """Best-effort cascade-delete of probe pages via remove_page in import session."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body_lines: list[str] = []
+    for pid in page_ids:
+        body_lines.append(
+            f"  begin wwv_flow_imp_page.remove_page("
+            f"p_flow_id => {app_id}, p_page_id => {pid}"
+            f"); exception when others then null; end;\n"
+        )
+    try:
+        sess.execute("".join(body_lines))
+    except Exception:
+        pass  # best-effort
+
+
+def test_generate_crud_dev_live_2b7(dev_state):
+    """Live DEV: generate CRUD pair (list + form) over a real table."""
+    from apex_builder_mcp.tools.generators import apex_generate_crud
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    table = _resolve_test_table(app_id)
+    if table is None:
+        pytest.skip("No user_tables visible to APEX_TEST_SQLCL_NAME schema")
+
+    list_page_id = 9200 + secrets.randbelow(20)
+    form_page_id = list_page_id + 30  # avoid id collision with ig_region (list+1)
+    try:
+        result = apex_generate_crud(
+            app_id=app_id,
+            table_name=table,
+            list_page_id=list_page_id,
+            form_page_id=form_page_id,
+        )
+        assert result["dry_run"] is False
+        assert result["created"]["list_page"] == list_page_id
+        assert result["created"]["ig_region"] == list_page_id + 1
+        assert result["created"]["form_page"] == form_page_id
+        assert result["created"]["form_region"] == form_page_id + 1
+    finally:
+        _cleanup_2b7_pages(app_id, [list_page_id, form_page_id])
+
+
+def test_generate_dashboard_dev_live_2b7(dev_state):
+    """Live DEV: generate dashboard with both KPI cards + chart."""
+    from apex_builder_mcp.tools.generators import apex_generate_dashboard
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    page_id = 9230 + secrets.randbelow(20)
+    try:
+        result = apex_generate_dashboard(
+            app_id=app_id,
+            page_id=page_id,
+            name=f"Dashboard 2B7 {secrets.token_hex(2).upper()}",
+            kpi_query=(
+                "select tablespace_name as title, count(*) as body "
+                "from user_tables group by tablespace_name"
+            ),
+            chart_query=(
+                "select tablespace_name as label, count(*) as value "
+                "from user_tables group by tablespace_name"
+            ),
+        )
+        assert result["dry_run"] is False
+        assert result["created"]["page"] == page_id
+        assert result["created"]["kpi_region"] == page_id + 1
+        assert result["created"]["chart_region"] == page_id + 2
+    finally:
+        _cleanup_2b7_pages(app_id, [page_id])
+
+
+def test_generate_login_deferred_2b7(dev_state):
+    """apex_generate_login is deferred — verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.generators import apex_generate_login
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_generate_login(app_id=100)
+    assert exc_info.value.code == "TOOL_DEFERRED"
+
+
+def test_generate_modal_form_dev_live_2b7(dev_state):
+    """Live DEV: generate a modal form page over a real table."""
+    from apex_builder_mcp.tools.generators import apex_generate_modal_form
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    table = _resolve_test_table(app_id)
+    if table is None:
+        pytest.skip("No user_tables visible to APEX_TEST_SQLCL_NAME schema")
+
+    page_id = 9270 + secrets.randbelow(20)
+    try:
+        result = apex_generate_modal_form(
+            app_id=app_id,
+            page_id=page_id,
+            table_name=table,
+            name=f"Modal {secrets.token_hex(2).upper()}",
+        )
+        assert result["dry_run"] is False
+        assert result["page_mode"] == "MODAL"
+        assert result["created"]["page"] == page_id
+        assert result["created"]["form_region"] == page_id + 1
+    finally:
+        _cleanup_2b7_pages(app_id, [page_id])

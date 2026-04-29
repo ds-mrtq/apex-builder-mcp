@@ -33,11 +33,16 @@ def apex_add_page(
     alias: str | None = None,
     page_template_options: str = "#DEFAULT#",
     autocomplete: bool = False,
+    page_mode: str | None = None,
 ) -> dict[str, Any]:
     """Add a page to an existing APEX app via wwv_flow_imp_page.create_page.
 
     DEV environments only. TEST returns dry-run SQL preview. PROD rejects.
     Wraps the call in wwv_flow_imp.import_begin/import_end (Phase 0 finding).
+
+    page_mode: optional APEX page mode. Common values: 'NORMAL', 'MODAL',
+    'NON_MODAL'. Used by `apex_generate_modal_form` to seed modal form pages.
+    When None, APEX defaults to NORMAL.
     """
     state = get_state()
     if state.profile is None:
@@ -50,13 +55,17 @@ def apex_add_page(
 
     alias_value = (alias or name).upper().replace(" ", "_")
     autocomplete_value = "ON" if autocomplete else "OFF"
+    page_mode_clause = ""
+    if page_mode is not None:
+        pm_esc = page_mode.replace("'", "''")
+        page_mode_clause = f",\n    p_page_mode => '{pm_esc}'"
     plsql_body = f"""  wwv_flow_imp_page.create_page(
     p_id => {page_id},
     p_name => '{name}',
     p_alias => '{alias_value}',
     p_step_title => '{name}',
     p_autocomplete_on_off => '{autocomplete_value}',
-    p_page_template_options => '{page_template_options}'
+    p_page_template_options => '{page_template_options}'{page_mode_clause}
   );
 """
 
@@ -119,6 +128,7 @@ def apex_add_page(
         "page_id": page_id,
         "name": name,
         "alias": alias_resolved,
+        "page_mode": page_mode,
         "before": {"pages": before.pages, "regions": before.regions, "items": before.items},
         "after": {"pages": after.pages, "regions": after.regions, "items": after.items},
         "auto_export": export_result,

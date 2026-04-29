@@ -15,6 +15,7 @@ from apex_builder_mcp.tools import (
 )
 from apex_builder_mcp.tools import connection as _conn  # noqa: F401
 from apex_builder_mcp.tools import dynamic_actions as _dynamic_actions  # noqa: F401
+from apex_builder_mcp.tools import generators as _generators  # noqa: F401
 from apex_builder_mcp.tools import inspect_apex as _inspect_apex  # noqa: F401
 from apex_builder_mcp.tools import inspect_db as _inspect_db  # noqa: F401
 from apex_builder_mcp.tools import item_lifecycle as _item_lifecycle  # noqa: F401
