@@ -17,3 +17,4 @@ class Profile(BaseModel):
     require_explicit_apply: bool = False
     block_destructive: bool = False
     snapshot_acl_before_write: bool = False
+    auth_mode: Literal["sqlcl", "password"] = "sqlcl"

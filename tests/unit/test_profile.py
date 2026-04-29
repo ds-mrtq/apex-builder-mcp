@@ -39,3 +39,26 @@ def test_profile_auto_export_dir_path():
     )
     assert p.auto_export_dir is not None
     assert p.auto_export_dir.name == "DEV1"
+
+
+def test_profile_default_auth_mode_is_sqlcl():
+    p = Profile(sqlcl_name="HTC_DEV1", environment="DEV", workspace="HTC_OPS")
+    assert p.auth_mode == "sqlcl"
+
+
+def test_profile_password_auth_mode():
+    p = Profile(
+        sqlcl_name="HTC_DEV1",
+        environment="DEV",
+        workspace="HTC_OPS",
+        auth_mode="password",
+    )
+    assert p.auth_mode == "password"
+
+
+def test_profile_invalid_auth_mode():
+    with pytest.raises(ValidationError):
+        Profile(
+            sqlcl_name="X", environment="DEV", workspace="W",
+            auth_mode="kerberos",  # type: ignore
+        )
