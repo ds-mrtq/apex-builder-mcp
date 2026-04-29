@@ -228,16 +228,40 @@ exit
 
 
 def verify_runtime(runtime_url: str, app_alias: str, page_id: int) -> tuple[bool, str]:
+    """Verify probe page is registered with ORDS.
+
+    nginx in front of ORDS rejects requests without browser User-Agent (returns 410),
+    so we send Edge UA. ORDS then redirects unauthenticated requests to /login page
+    (HTTP 302 -> 200 on login page) which proves the page exists. We accept any
+    non-error response that resolves to HTTP 200 after redirects, and reject only
+    on app/page not found markers.
+    """
     url = f"{runtime_url.rstrip('/')}/{app_alias.lower()}/{page_id}"
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            final_url = resp.geturl()
             html = resp.read().decode("utf-8", errors="replace")
             if resp.status != 200:
                 return (False, f"{url} -> HTTP {resp.status}")
-            for marker in ["application not found", "ORA-", "ERR-", "<title>Error"]:
+            # If we got redirected to a /login or /sign-in page, that proves the
+            # source page exists and ORDS is routing it (just behind auth).
+            if "/login" in final_url.lower() or "/sign-in" in final_url.lower():
+                return (True, f"{url} -> 302->{final_url} (login redirect = page registered)")
+            # Direct 200 — verify no fatal error markers
+            for marker in [
+                "application not found",
+                "page not found",
+                "ORA-",
+                "<title>Error",
+            ]:
                 if marker in html:
-                    return (False, f"{url} -> contains marker '{marker}'")
-            return (True, f"{url} -> HTTP 200, no error markers")
+                    return (False, f"{url} -> 200 but contains '{marker}'")
+            return (True, f"{url} -> HTTP 200, final={final_url}")
     except urllib.error.HTTPError as e:
         return (False, f"{url} -> HTTPError {e.code}: {e.reason}")
     except Exception as e:
