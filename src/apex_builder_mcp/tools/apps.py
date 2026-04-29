@@ -37,6 +37,10 @@ from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
+from apex_builder_mcp.tools._read_helpers import (
+    query_app_details,
+    query_validate_app,
+)
 from apex_builder_mcp.tools._write_helpers import query_workspace_id
 
 
@@ -66,37 +70,14 @@ def _require_profile() -> Profile:
 def apex_get_app_details(app_id: int) -> dict[str, Any]:
     """Full app metadata: 30+ columns from apex_applications.
 
-    Read-only. Uses the oracledb pool. Returns
-    `{application_id, found: True, details: {...}}` on hit, or
-    `{application_id, found: False}` when the app does not exist.
+    Read-only. Branches on profile.auth_mode (SQLcl subprocess vs oracledb
+    pool). Returns `{application_id, found: True, details: {...}}` on hit,
+    or `{application_id, found: False}` when the app does not exist.
     """
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            select application_id, application_name, alias, pages, owner,
-                   workspace, version, build_status, availability_status,
-                   authentication_scheme, page_template, compatibility_mode,
-                   file_prefix, last_updated_on, last_updated_by, created_on,
-                   created_by, theme_number, theme_style_by_user_pref,
-                   application_group, application_primary_language,
-                   deep_linking, debugging, logo_type, logo_text,
-                   nav_bar_type, friendly_url, build_options, image_prefix,
-                   home_link
-              from apex_applications where application_id = :a
-            """,
-            a=app_id,
-        )
-        row = cur.fetchone()
-        if row is None:
-            return {"application_id": app_id, "found": False}
-        cols = [d[0] for d in cur.description]
-    details = dict(zip(cols, row, strict=False))
-    # Stringify dates so the result is JSON-serializable for FastMCP transport.
-    for k, v in list(details.items()):
-        if hasattr(v, "isoformat"):
-            details[k] = v.isoformat()
+    profile = _require_profile()
+    details = query_app_details(profile, app_id)
+    if details is None:
+        return {"application_id": app_id, "found": False}
     return {
         "application_id": app_id,
         "found": True,
@@ -125,110 +106,66 @@ def apex_validate_app(app_id: int) -> dict[str, Any]:
       * Pages with zero regions
 
     Returns {app_id, ok: bool, issues: [...], counts: {...}}.
+    Branches on profile.auth_mode (SQLcl subprocess vs oracledb pool).
     """
-    pool = _get_pool()
+    profile = _require_profile()
+    raw = query_validate_app(profile, app_id)
+    if raw is None:
+        return {
+            "app_id": app_id,
+            "ok": False,
+            "issues": [
+                {
+                    "code": "APP_NOT_FOUND",
+                    "message": f"application_id={app_id} does not exist",
+                }
+            ],
+            "counts": {},
+        }
+
     issues: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+    counts["pages_metadata"] = int(raw["app_meta"][1] or 0)
 
-    with pool.acquire() as conn:
-        cur = conn.cursor()
+    present_required: set[int] = raw["present_required"]
+    for required_pid, label in ((0, "Global Page"), (1, "Home Page")):
+        if required_pid not in present_required:
+            issues.append(
+                {
+                    "code": "MISSING_REQUIRED_PAGE",
+                    "page_id": required_pid,
+                    "message": f"{label} (page {required_pid}) not found",
+                }
+            )
 
-        # 0. App existence
-        cur.execute(
-            "select application_name, pages from apex_applications "
-            "where application_id = :a",
-            a=app_id,
-        )
-        app_row = cur.fetchone()
-        if app_row is None:
-            return {
-                "app_id": app_id,
-                "ok": False,
-                "issues": [
-                    {
-                        "code": "APP_NOT_FOUND",
-                        "message": f"application_id={app_id} does not exist",
-                    }
-                ],
-                "counts": {},
+    orphans = raw["orphans"]
+    counts["orphan_items"] = len(orphans)
+    for item_id, item_name, page_id, missing_region_id in orphans:
+        issues.append(
+            {
+                "code": "ORPHAN_ITEM",
+                "item_id": int(item_id),
+                "item_name": str(item_name),
+                "page_id": page_id,
+                "missing_region_id": missing_region_id,
+                "message": (
+                    f"item {item_name!r} on page {page_id} references "
+                    f"missing region_id {missing_region_id}"
+                ),
             }
-        counts["pages_metadata"] = int(app_row[1] or 0)
-
-        # 1. Required well-known pages
-        cur.execute(
-            "select page_id from apex_application_pages "
-            "where application_id = :a and page_id in (0, 1)",
-            a=app_id,
         )
-        present_required = {int(r[0]) for r in cur.fetchall()}
-        for required_pid, label in ((0, "Global Page"), (1, "Home Page")):
-            if required_pid not in present_required:
-                issues.append(
-                    {
-                        "code": "MISSING_REQUIRED_PAGE",
-                        "page_id": required_pid,
-                        "message": f"{label} (page {required_pid}) not found",
-                    }
-                )
 
-        # 2. Orphan items (item references region not in apex_application_page_regions)
-        cur.execute(
-            """
-            select i.item_id, i.item_name, i.page_id, i.item_plug_id
-              from apex_application_page_items i
-             where i.application_id = :a
-               and i.item_plug_id is not null
-               and not exists (
-                 select 1 from apex_application_page_regions r
-                  where r.application_id = i.application_id
-                    and r.region_id = i.item_plug_id
-               )
-            """,
-            a=app_id,
+    empty_pages = raw["empty_pages"]
+    counts["pages_without_regions"] = len(empty_pages)
+    for page_id, page_name in empty_pages:
+        issues.append(
+            {
+                "code": "PAGE_NO_REGIONS",
+                "page_id": int(page_id),
+                "page_name": str(page_name),
+                "message": f"page {page_id} ({page_name!r}) has no regions",
+            }
         )
-        orphans = cur.fetchall()
-        counts["orphan_items"] = len(orphans)
-        for r in orphans:
-            issues.append(
-                {
-                    "code": "ORPHAN_ITEM",
-                    "item_id": int(r[0]),
-                    "item_name": str(r[1]),
-                    "page_id": int(r[2]) if r[2] is not None else None,
-                    "missing_region_id": int(r[3]) if r[3] is not None else None,
-                    "message": (
-                        f"item {r[1]!r} on page {r[2]} references "
-                        f"missing region_id {r[3]}"
-                    ),
-                }
-            )
-
-        # 3. Pages with zero regions (excluding page 0)
-        cur.execute(
-            """
-            select p.page_id, p.page_name
-              from apex_application_pages p
-             where p.application_id = :a
-               and p.page_id <> 0
-               and not exists (
-                 select 1 from apex_application_page_regions r
-                  where r.application_id = p.application_id
-                    and r.page_id = p.page_id
-               )
-            """,
-            a=app_id,
-        )
-        empty_pages = cur.fetchall()
-        counts["pages_without_regions"] = len(empty_pages)
-        for r in empty_pages:
-            issues.append(
-                {
-                    "code": "PAGE_NO_REGIONS",
-                    "page_id": int(r[0]),
-                    "page_name": str(r[1]),
-                    "message": f"page {r[0]} ({r[1]!r}) has no regions",
-                }
-            )
 
     return {
         "app_id": app_id,

@@ -39,62 +39,20 @@ def _setup_state(env: str = "DEV") -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeCursor:
-    def __init__(self, row, description):
-        self._row = row
-        self.description = description
-
-    def execute(self, *_args, **_kwargs):
-        return None
-
-    def fetchone(self):
-        return self._row
-
-
-class _FakeConn:
-    def __init__(self, cursor):
-        self._cursor = cursor
-
-    def cursor(self):
-        return self._cursor
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-
-class _FakePool:
-    def __init__(self, cursor):
-        self._cursor = cursor
-
-    def acquire(self):
-        return _FakeConn(self._cursor)
-
-
 def test_get_app_details_found(monkeypatch):
-    description = [
-        ("APPLICATION_ID",), ("APPLICATION_NAME",), ("ALIAS",), ("PAGES",),
-        ("OWNER",), ("WORKSPACE",), ("VERSION",), ("BUILD_STATUS",),
-        ("AVAILABILITY_STATUS",), ("AUTHENTICATION_SCHEME",),
-        ("PAGE_TEMPLATE",), ("COMPATIBILITY_MODE",), ("FILE_PREFIX",),
-        ("LAST_UPDATED_ON",), ("LAST_UPDATED_BY",), ("CREATED_ON",),
-        ("CREATED_BY",), ("THEME_NUMBER",), ("THEME_STYLE_BY_USER_PREF",),
-        ("APPLICATION_GROUP",), ("APPLICATION_PRIMARY_LANGUAGE",),
-        ("DEEP_LINKING",), ("DEBUGGING",), ("LOGO_TYPE",), ("LOGO_TEXT",),
-        ("NAV_BAR_TYPE",), ("FRIENDLY_URL",), ("BUILD_OPTIONS",),
-        ("IMAGE_PREFIX",), ("HOME_LINK",),
-    ]
-    row = [
-        100, "MY APP", "MYAPP", 12, "EREPORT", "EREPORT", "1.0", "Run and Develop",
-        "Available", "PLUGIN", "PT_OK", "24.2", "f100", None, "ADMIN", None,
-        "ADMIN", 42, "Vita", "MyGroup", "en", "Y", "N", "TEXT", "MY APP",
-        "STANDARD", "Y", None, "/i/", "f?p=&APP_ID.:1",
-    ]
-    cur = _FakeCursor(row, description)
+    _setup_state()
+    fake_details = {
+        "APPLICATION_ID": 100,
+        "APPLICATION_NAME": "MY APP",
+        "ALIAS": "MYAPP",
+        "PAGES": 12,
+        "OWNER": "EREPORT",
+        "WORKSPACE": "EREPORT",
+        "VERSION": "1.0",
+    }
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.apps._get_pool", lambda: _FakePool(cur)
+        "apex_builder_mcp.tools.apps.query_app_details",
+        lambda profile, app_id: dict(fake_details),
     )
 
     result = apex_get_app_details(app_id=100)
@@ -105,13 +63,20 @@ def test_get_app_details_found(monkeypatch):
 
 
 def test_get_app_details_not_found(monkeypatch):
-    cur = _FakeCursor(None, [("APPLICATION_ID",)])
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.apps._get_pool", lambda: _FakePool(cur)
+        "apex_builder_mcp.tools.apps.query_app_details",
+        lambda profile, app_id: None,
     )
 
     result = apex_get_app_details(app_id=99999)
     assert result["found"] is False
+
+
+def test_get_app_details_no_profile_raises():
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_get_app_details(app_id=100)
+    assert exc_info.value.code == "NOT_CONNECTED"
 
 
 # ---------------------------------------------------------------------------
@@ -119,40 +84,11 @@ def test_get_app_details_not_found(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-class _MultiQueryCursor:
-    """Cursor that returns different results per execute() call (by index)."""
-
-    def __init__(self, rows_per_call: list, descriptions_per_call: list | None = None):
-        self._rows = rows_per_call
-        self._descriptions = descriptions_per_call or [None] * len(rows_per_call)
-        self._idx = -1
-        self.description: list | None = None
-
-    def execute(self, *_args, **_kwargs):
-        self._idx += 1
-        if self._idx < len(self._descriptions):
-            self.description = self._descriptions[self._idx]
-
-    def fetchone(self):
-        if self._idx >= len(self._rows):
-            return None
-        result = self._rows[self._idx]
-        return result if (result is None or isinstance(result, list | tuple)) else None
-
-    def fetchall(self):
-        if self._idx >= len(self._rows):
-            return []
-        result = self._rows[self._idx]
-        if isinstance(result, list):
-            return result
-        return []
-
-
 def test_validate_app_not_found(monkeypatch):
-    # Single call: select application_name, pages -> None
-    cur = _MultiQueryCursor([None])
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.apps._get_pool", lambda: _FakePool(cur)
+        "apex_builder_mcp.tools.apps.query_validate_app",
+        lambda profile, app_id: None,
     )
 
     result = apex_validate_app(app_id=99999)
@@ -161,15 +97,15 @@ def test_validate_app_not_found(monkeypatch):
 
 
 def test_validate_app_clean(monkeypatch):
-    rows = [
-        ("MY APP", 5),  # 0: app metadata
-        [(0,), (1,)],   # 1: present_required pages 0+1
-        [],             # 2: orphan items (none)
-        [],             # 3: pages with no regions (none)
-    ]
-    cur = _MultiQueryCursor(rows)
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.apps._get_pool", lambda: _FakePool(cur)
+        "apex_builder_mcp.tools.apps.query_validate_app",
+        lambda profile, app_id: {
+            "app_meta": ("MY APP", 5),
+            "present_required": {0, 1},
+            "orphans": [],
+            "empty_pages": [],
+        },
     )
 
     result = apex_validate_app(app_id=100)
@@ -179,15 +115,15 @@ def test_validate_app_clean(monkeypatch):
 
 
 def test_validate_app_with_issues(monkeypatch):
-    rows = [
-        ("BROKEN APP", 3),                 # 0: app metadata
-        [(0,)],                            # 1: only page 0 present (missing 1)
-        [(50, "P10_X", 10, 999)],          # 2: orphan item
-        [(2, "Empty Page")],               # 3: page with no regions
-    ]
-    cur = _MultiQueryCursor(rows)
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.apps._get_pool", lambda: _FakePool(cur)
+        "apex_builder_mcp.tools.apps.query_validate_app",
+        lambda profile, app_id: {
+            "app_meta": ("BROKEN APP", 3),
+            "present_required": {0},  # missing page 1
+            "orphans": [(50, "P10_X", 10, 999)],
+            "empty_pages": [(2, "Empty Page")],
+        },
     )
 
     result = apex_validate_app(app_id=100)
@@ -198,6 +134,12 @@ def test_validate_app_with_issues(monkeypatch):
     assert "PAGE_NO_REGIONS" in codes
     assert result["counts"]["orphan_items"] == 1
     assert result["counts"]["pages_without_regions"] == 1
+
+
+def test_validate_app_no_profile_raises():
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_validate_app(app_id=100)
+    assert exc_info.value.code == "NOT_CONNECTED"
 
 
 # ---------------------------------------------------------------------------

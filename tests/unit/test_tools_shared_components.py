@@ -147,22 +147,24 @@ def test_add_lov_executes_on_dev(monkeypatch):
 
 
 def test_list_lovs_returns_dict(monkeypatch):
-    fake_cur = MagicMock()
-    fake_cur.fetchall.return_value = [
-        (1001, "STATUS_LOV", "Static"),
-        (1002, "ROLE_LOV", "Dynamic"),
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    _setup_state(env="DEV")
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.shared_components._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.shared_components.query_lovs",
+        lambda profile, app_id: [
+            {"lov_id": 1001, "name": "STATUS_LOV", "lov_type": "Static"},
+            {"lov_id": 1002, "name": "ROLE_LOV", "lov_type": "Dynamic"},
+        ],
     )
     result = apex_list_lovs(app_id=100)
     assert result["count"] == 2
     assert result["lovs"][0]["lov_id"] == 1001
     assert result["lovs"][0]["name"] == "STATUS_LOV"
+
+
+def test_list_lovs_no_profile_raises():
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_list_lovs(app_id=100)
+    assert exc_info.value.code == "NOT_CONNECTED"
 
 
 # ---------------------------------------------------------------------------

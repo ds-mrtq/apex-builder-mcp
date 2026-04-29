@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from apex_builder_mcp.connection.state import get_state, reset_state_for_tests
+from apex_builder_mcp.schema.errors import ApexBuilderError
+from apex_builder_mcp.schema.profile import Profile
 from apex_builder_mcp.tools.inspect_apex import (
     apex_describe_acl,
     apex_describe_app,
@@ -16,6 +21,24 @@ from apex_builder_mcp.tools.inspect_apex import (
     apex_list_regions,
     apex_list_workspace_users,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset():
+    reset_state_for_tests()
+    yield
+    reset_state_for_tests()
+
+
+def _setup_state(env: str = "DEV") -> None:
+    profile = Profile(
+        sqlcl_name="ereport_test8001",
+        environment=env,  # type: ignore[arg-type]
+        workspace="EREPORT",
+    )
+    state = get_state()
+    state.set_profile(profile)
+    state.mark_connected()
 
 
 def _mock_pool(monkeypatch, fetchall_returns=None, fetchone_returns=None):
@@ -240,17 +263,29 @@ def test_list_processes(monkeypatch):
 
 
 def test_list_workspace_users(monkeypatch):
-    fake_cur = MagicMock()
-    fake_cur.fetchall.return_value = [
-        ("EREPORT", "ADMIN", "admin@example.com", "Yes", "Yes", "No", None),
-        ("EREPORT", "DEV1", "dev1@example.com", "No", "Yes", "No", None),
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.inspect_apex.query_workspace_users",
+        lambda profile, workspace: [
+            {
+                "workspace_name": "EREPORT",
+                "user_name": "ADMIN",
+                "email": "admin@example.com",
+                "is_admin": "Yes",
+                "is_developer": "Yes",
+                "account_locked": "No",
+                "last_login": None,
+            },
+            {
+                "workspace_name": "EREPORT",
+                "user_name": "DEV1",
+                "email": "dev1@example.com",
+                "is_admin": "No",
+                "is_developer": "Yes",
+                "account_locked": "No",
+                "last_login": None,
+            },
+        ],
     )
     result = apex_list_workspace_users(workspace="EREPORT")
     assert result["count"] == 2
@@ -261,21 +296,39 @@ def test_list_workspace_users(monkeypatch):
 
 
 def test_list_workspace_users_no_filter(monkeypatch):
-    fake_cur = MagicMock()
-    fake_cur.fetchall.return_value = [
-        ("EREPORT", "ADMIN", "a@x", "Yes", "Yes", "No", None),
-        ("OTHER_WS", "USER1", "u@x", "No", "Yes", "No", None),
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.inspect_apex.query_workspace_users",
+        lambda profile, workspace: [
+            {
+                "workspace_name": "EREPORT",
+                "user_name": "ADMIN",
+                "email": "a@x",
+                "is_admin": "Yes",
+                "is_developer": "Yes",
+                "account_locked": "No",
+                "last_login": None,
+            },
+            {
+                "workspace_name": "OTHER_WS",
+                "user_name": "USER1",
+                "email": "u@x",
+                "is_admin": "No",
+                "is_developer": "Yes",
+                "account_locked": "No",
+                "last_login": None,
+            },
+        ],
     )
     result = apex_list_workspace_users()
     assert result["count"] == 2
     assert result["workspace"] is None
+
+
+def test_list_workspace_users_no_profile_raises():
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_list_workspace_users()
+    assert exc_info.value.code == "NOT_CONNECTED"
 
 
 def test_list_dynamic_actions(monkeypatch):

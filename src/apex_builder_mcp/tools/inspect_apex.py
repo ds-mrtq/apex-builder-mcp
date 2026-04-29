@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from apex_builder_mcp.connection.state import get_state
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
+from apex_builder_mcp.schema.errors import ApexBuilderError
+from apex_builder_mcp.tools._read_helpers import query_workspace_users
 
 
 def _get_pool() -> Any:
@@ -348,44 +351,17 @@ def apex_list_workspace_users(workspace: str | None = None) -> dict[str, Any]:
     Reads from `apex_workspace_apex_users`. Returns user_name, is_admin
     (workspace_admin), is_developer (i.e. is_application_developer),
     account_locked, last_login (date_last_login), workspace_name, and email.
+
+    Branches on profile.auth_mode: SQLcl subprocess vs oracledb pool.
     """
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        if workspace:
-            cur.execute(
-                """
-                select workspace_name, user_name, email,
-                       is_admin, is_application_developer,
-                       account_locked, date_last_login
-                  from apex_workspace_apex_users
-                 where workspace_name = :ws
-                 order by user_name
-                """,
-                ws=workspace.upper(),
-            )
-        else:
-            cur.execute(
-                """
-                select workspace_name, user_name, email,
-                       is_admin, is_application_developer,
-                       account_locked, date_last_login
-                  from apex_workspace_apex_users
-                 order by workspace_name, user_name
-                """
-            )
-        users = [
-            {
-                "workspace_name": r[0],
-                "user_name": r[1],
-                "email": r[2],
-                "is_admin": r[3],
-                "is_developer": r[4],
-                "account_locked": r[5],
-                "last_login": str(r[6]) if r[6] else None,
-            }
-            for r in cur.fetchall()
-        ]
+    state = get_state()
+    if state.profile is None:
+        raise ApexBuilderError(
+            code="NOT_CONNECTED",
+            message="No active profile",
+            suggestion="Call apex_connect first",
+        )
+    users = query_workspace_users(state.profile, workspace)
     return {
         "workspace": workspace.upper() if workspace else None,
         "users": users,

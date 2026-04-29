@@ -919,21 +919,16 @@ def test_add_lov_dev_live(dev_state):
 def test_list_lovs_dev_live(dev_state):
     """Live DEV: read-only call to apex_list_lovs returns at least one LOV.
 
-    NOTE: this requires auth_mode=password (oracledb pool) since the read uses
-    the connection pool. If pool isn't configured, skip cleanly.
+    Now branches on profile.auth_mode (sqlcl in tests) — uses SQLcl subprocess
+    when no oracledb pool is configured.
     """
     from apex_builder_mcp.tools.shared_components import apex_list_lovs
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
-    try:
-        result = apex_list_lovs(app_id=app_id)
-        assert "lovs" in result
-        assert "count" in result
-        # We do not assert count > 0 because a fresh app may have zero LOVs.
-    except Exception as e:
-        # apex_list_lovs needs an oracledb pool which sqlcl-only profiles
-        # don't have. Accept this as a skip in pure-sqlcl test env.
-        pytest.skip(f"apex_list_lovs requires oracledb pool: {e}")
+    result = apex_list_lovs(app_id=app_id)
+    assert "lovs" in result
+    assert "count" in result
+    # We do not assert count > 0 because a fresh app may have zero LOVs.
 
 
 def test_add_auth_scheme_dev_live(dev_state):
@@ -1115,46 +1110,43 @@ def test_add_app_css_deferred_live_2b6(dev_state):
 
 
 def test_search_objects_dev_live_2b6(dev_state):
-    """Live DEV: search for objects matching APEX% pattern.
+    """Live DEV: search for objects matching APEX_% pattern.
 
-    Read-only tool; uses oracledb pool. Skips cleanly if pool unavailable.
+    Branches on profile.auth_mode — uses SQLcl subprocess under sqlcl mode.
     """
     from apex_builder_mcp.tools.inspect_db import apex_search_objects
 
-    try:
-        result = apex_search_objects(pattern="APEX_%", object_types=["VIEW"])
-        assert "objects" in result
-        assert "count" in result
-        # Real DBs have many APEX_* views; if 0 the env is unusual but valid.
-    except Exception as e:
-        pytest.skip(f"apex_search_objects requires oracledb pool: {e}")
+    result = apex_search_objects(pattern="APEX_%", object_types=["VIEW"])
+    assert "objects" in result
+    assert "count" in result
+    # Real DBs have many APEX_* views; if 0 the env is unusual but valid.
 
 
 def test_dependencies_dev_live_2b6(dev_state):
-    """Live DEV: get dependencies of a known APEX package."""
+    """Live DEV: get dependencies of DUAL.
+
+    Branches on profile.auth_mode — uses SQLcl subprocess under sqlcl mode.
+    """
     from apex_builder_mcp.tools.inspect_db import apex_dependencies
 
-    try:
-        result = apex_dependencies(object_name="DUAL")
-        assert "uses" in result
-        assert "used_by" in result
-        # DUAL is heavily depended-on; expect used_by_count > 0 typically.
-    except Exception as e:
-        pytest.skip(f"apex_dependencies requires oracledb pool: {e}")
+    result = apex_dependencies(object_name="DUAL")
+    assert "uses" in result
+    assert "used_by" in result
+    # DUAL is heavily depended-on; expect used_by_count > 0 typically.
 
 
 def test_list_workspace_users_dev_live_2b6(dev_state):
-    """Live DEV: list workspace users."""
+    """Live DEV: list workspace users.
+
+    Branches on profile.auth_mode — uses SQLcl subprocess under sqlcl mode.
+    """
     from apex_builder_mcp.tools.inspect_apex import apex_list_workspace_users
 
-    try:
-        result = apex_list_workspace_users(
-            workspace=os.environ.get("APEX_TEST_WORKSPACE", "EREPORT")
-        )
-        assert "users" in result
-        assert "count" in result
-    except Exception as e:
-        pytest.skip(f"apex_list_workspace_users requires oracledb pool: {e}")
+    result = apex_list_workspace_users(
+        workspace=os.environ.get("APEX_TEST_WORKSPACE", "EREPORT")
+    )
+    assert "users" in result
+    assert "count" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1319,14 +1311,14 @@ def test_generate_modal_form_dev_live_2b7(dev_state):
 
 
 def test_get_app_details_dev_live_2b8(dev_state):
-    """Live DEV: get full metadata of the source app."""
+    """Live DEV: get full metadata of the source app.
+
+    Branches on profile.auth_mode — uses SQLcl subprocess under sqlcl mode.
+    """
     from apex_builder_mcp.tools.apps import apex_get_app_details
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
-    try:
-        result = apex_get_app_details(app_id=app_id)
-    except Exception as e:
-        pytest.skip(f"apex_get_app_details requires oracledb pool: {e}")
+    result = apex_get_app_details(app_id=app_id)
 
     assert result["found"] is True
     assert result["application_id"] == app_id
@@ -1339,23 +1331,19 @@ def test_get_app_details_not_found_dev_live_2b8(dev_state):
     """Live DEV: get_app_details returns found=False for non-existent app."""
     from apex_builder_mcp.tools.apps import apex_get_app_details
 
-    try:
-        result = apex_get_app_details(app_id=999999)
-    except Exception as e:
-        pytest.skip(f"apex_get_app_details requires oracledb pool: {e}")
-
+    result = apex_get_app_details(app_id=999999)
     assert result["found"] is False
 
 
 def test_validate_app_dev_live_2b8(dev_state):
-    """Live DEV: validate the source app (read-only heuristic checks)."""
+    """Live DEV: validate the source app (read-only heuristic checks).
+
+    Branches on profile.auth_mode — uses SQLcl subprocess under sqlcl mode.
+    """
     from apex_builder_mcp.tools.apps import apex_validate_app
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
-    try:
-        result = apex_validate_app(app_id=app_id)
-    except Exception as e:
-        pytest.skip(f"apex_validate_app requires oracledb pool: {e}")
+    result = apex_validate_app(app_id=app_id)
 
     assert "ok" in result
     assert "issues" in result
@@ -1368,11 +1356,7 @@ def test_validate_app_not_found_dev_live_2b8(dev_state):
     """Live DEV: validate_app on missing app reports APP_NOT_FOUND."""
     from apex_builder_mcp.tools.apps import apex_validate_app
 
-    try:
-        result = apex_validate_app(app_id=999999)
-    except Exception as e:
-        pytest.skip(f"apex_validate_app requires oracledb pool: {e}")
-
+    result = apex_validate_app(app_id=999999)
     assert result["ok"] is False
     assert any(i["code"] == "APP_NOT_FOUND" for i in result["issues"])
 
@@ -1408,15 +1392,10 @@ def test_create_and_delete_app_dev_live_2b8(dev_state):
         assert create_result["partial_functionality"] is True
         create_done = True
 
-        # 2. Verify via apex_get_app_details (uses pool, may skip if no pool)
-        try:
-            details = apex_get_app_details(app_id=sandbox_app_id)
-            assert details["found"] is True
-            assert details["details"]["ALIAS"] == sandbox_alias
-        except Exception:
-            # pool may be unavailable when running with auth_mode=sqlcl;
-            # the create is already verified in apex_create_app itself.
-            pass
+        # 2. Verify via apex_get_app_details (now sqlcl-fallback aware).
+        details = apex_get_app_details(app_id=sandbox_app_id)
+        assert details["found"] is True
+        assert details["details"]["ALIAS"] == sandbox_alias
     finally:
         # 3. Cleanup — always delete, even if assertions failed mid-test
         try:

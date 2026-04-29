@@ -5,9 +5,14 @@ import re
 from typing import Any
 
 from apex_builder_mcp.apex_api.sql_guard import is_safe_select, validate_object_name
+from apex_builder_mcp.connection.state import get_state
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
+from apex_builder_mcp.tools._read_helpers import (
+    query_dependencies,
+    query_search_objects,
+)
 
 MAX_ROWS = 10_000
 ALLOWED_OBJECT_TYPES = {
@@ -203,42 +208,16 @@ def apex_search_objects(
                 )
             types_upper.append(up)
 
-    pool = _get_pool()
-    pat_upper = pattern.upper()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        if types_upper:
-            # Build type-list IN clause via bind expansion.
-            placeholders = ",".join(f":t{i}" for i in range(len(types_upper)))
-            sql = (
-                "select owner, object_name, object_type, status, last_ddl_time "
-                "from all_objects "
-                "where object_name like :pat "
-                f"and object_type in ({placeholders}) "
-                "order by owner, object_name"
-            )
-            binds: dict[str, Any] = {"pat": pat_upper}
-            for i, t in enumerate(types_upper):
-                binds[f"t{i}"] = t
-            cur.execute(sql, **binds)
-        else:
-            cur.execute(
-                "select owner, object_name, object_type, status, last_ddl_time "
-                "from all_objects "
-                "where object_name like :pat "
-                "order by owner, object_name",
-                pat=pat_upper,
-            )
-        rows = [
-            {
-                "owner": r[0],
-                "object_name": r[1],
-                "object_type": r[2],
-                "status": r[3],
-                "last_ddl_time": str(r[4]) if r[4] else None,
-            }
-            for r in cur.fetchmany(MAX_ROWS)
-        ]
+    state = get_state()
+    if state.profile is None:
+        raise ApexBuilderError(
+            code="NOT_CONNECTED",
+            message="No active profile",
+            suggestion="Call apex_connect first",
+        )
+    rows = query_search_objects(
+        state.profile, pattern, types_upper or None, MAX_ROWS
+    )
     return {
         "pattern": pattern,
         "object_types": types_upper or None,
@@ -274,77 +253,16 @@ def apex_dependencies(
                 "FUNCTION, PROCEDURE, VIEW, TYPE, TYPE BODY, TRIGGER."
             ),
         )
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        # uses: rows where this object is the dependent
-        if type_upper:
-            cur.execute(
-                """
-                select owner, name, type,
-                       referenced_owner, referenced_name, referenced_type
-                  from all_dependencies
-                 where name = :n and type = :t
-                 order by referenced_owner, referenced_name
-                """,
-                n=obj_upper, t=type_upper,
-            )
-        else:
-            cur.execute(
-                """
-                select owner, name, type,
-                       referenced_owner, referenced_name, referenced_type
-                  from all_dependencies
-                 where name = :n
-                 order by referenced_owner, referenced_name
-                """,
-                n=obj_upper,
-            )
-        uses = [
-            {
-                "owner": r[0],
-                "name": r[1],
-                "type": r[2],
-                "referenced_owner": r[3],
-                "referenced_name": r[4],
-                "referenced_type": r[5],
-            }
-            for r in cur.fetchmany(MAX_ROWS)
-        ]
-        # used_by: rows where this object is the referenced
-        if type_upper:
-            cur.execute(
-                """
-                select owner, name, type,
-                       referenced_owner, referenced_name, referenced_type
-                  from all_dependencies
-                 where referenced_name = :n and referenced_type = :t
-                 order by owner, name
-                """,
-                n=obj_upper, t=type_upper,
-            )
-        else:
-            cur.execute(
-                """
-                select owner, name, type,
-                       referenced_owner, referenced_name, referenced_type
-                  from all_dependencies
-                 where referenced_name = :n
-                 order by owner, name
-                """,
-                n=obj_upper,
-            )
-        used_by = [
-            {
-                "owner": r[0],
-                "name": r[1],
-                "type": r[2],
-                "referenced_owner": r[3],
-                "referenced_name": r[4],
-                "referenced_type": r[5],
-            }
-            for r in cur.fetchmany(MAX_ROWS)
-        ]
+    state = get_state()
+    if state.profile is None:
+        raise ApexBuilderError(
+            code="NOT_CONNECTED",
+            message="No active profile",
+            suggestion="Call apex_connect first",
+        )
+    uses, used_by = query_dependencies(
+        state.profile, obj_upper, type_upper, MAX_ROWS
+    )
     return {
         "object_name": obj_upper,
         "object_type": type_upper,

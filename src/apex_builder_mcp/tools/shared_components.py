@@ -55,6 +55,7 @@ from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
+from apex_builder_mcp.tools._read_helpers import query_lovs
 from apex_builder_mcp.tools._write_helpers import (
     query_metadata_snapshot,
     query_workspace_id,
@@ -281,27 +282,20 @@ def apex_add_lov(
 # ---------------------------------------------------------------------------
 
 
-def _get_pool() -> Any:
-    from apex_builder_mcp.tools.connection import _get_or_create_pool
-
-    return _get_or_create_pool()
-
-
 @apex_tool(name="apex_list_lovs", category=Category.READ_APEX)
 def apex_list_lovs(app_id: int) -> dict[str, Any]:
-    """List LOVs in an APEX application (read-only)."""
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "select lov_id, list_of_values_name, lov_type "
-            "from apex_application_lovs where application_id = :a "
-            "order by list_of_values_name",
-            a=app_id,
+    """List LOVs in an APEX application (read-only).
+
+    Branches on profile.auth_mode: SQLcl subprocess vs oracledb pool.
+    """
+    state = get_state()
+    if state.profile is None:
+        raise ApexBuilderError(
+            code="NOT_CONNECTED",
+            message="No active profile",
+            suggestion="Call apex_connect first",
         )
-        lovs = [
-            {"lov_id": r[0], "name": r[1], "lov_type": r[2]} for r in cur.fetchall()
-        ]
+    lovs = query_lovs(state.profile, app_id)
     return {"app_id": app_id, "lovs": lovs, "count": len(lovs)}
 
 
