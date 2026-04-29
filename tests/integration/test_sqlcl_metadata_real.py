@@ -38,3 +38,17 @@ def test_read_real_sqlcl_connection():
     # MUST NOT have password
     assert not hasattr(md, "password")
     print(f"\nResolved {name}: {md.user}@{md.dsn}")
+
+
+def test_read_via_connmgr_real():
+    """Verify connmgr fallback works with real SQLcl 26 store."""
+    name = os.environ.get("APEX_TEST_SQLCL_NAME")
+    if not name:
+        pytest.skip("APEX_TEST_SQLCL_NAME not set")
+    md = read_connection_metadata(name)
+    assert md.host
+    assert md.port > 0
+    assert md.service_name
+    assert md.user
+    assert not hasattr(md, "password")
+    print(f"\n  connmgr resolved: {md.user}@{md.dsn}")
