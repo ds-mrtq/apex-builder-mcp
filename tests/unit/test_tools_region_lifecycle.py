@@ -29,6 +29,10 @@ def _setup_state(env: str = "DEV") -> None:
     state.mark_connected()
 
 
+def _ok_sqlcl(*args, **kwargs):
+    return MagicMock(rc=0, stdout="", cleaned="", stderr="")
+
+
 def test_delete_region_no_profile_raises():
     with pytest.raises(ApexBuilderError) as exc_info:
         apex_delete_region(app_id=100, page_id=8500, region_id=12345)
@@ -46,21 +50,16 @@ def test_delete_region_dry_run_on_test():
     _setup_state(env="TEST")
     result = apex_delete_region(app_id=100, page_id=8500, region_id=12345)
     assert result["dry_run"] is True
-    assert "wwv_flow_app_builder_api.delete_region" in result["sql_preview"]
+    assert "apex_240200.wwv_flow_app_builder_api.delete_region" in result["sql_preview"]
     assert "p_page_id => 8500" in result["sql_preview"]
     assert "p_region_id => 12345" in result["sql_preview"]
 
 
 def test_delete_region_executes_on_dev(monkeypatch):
     _setup_state(env="DEV")
-    fake_sess = MagicMock()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.region_lifecycle.ImportSession",
-        lambda **kw: fake_sess,
-    )
-    monkeypatch.setattr(
-        "apex_builder_mcp.tools.region_lifecycle.query_workspace_id",
-        lambda profile, ws: 100002,
+        "apex_builder_mcp.tools.region_lifecycle.run_sqlcl",
+        _ok_sqlcl,
     )
     snaps = iter(
         [
@@ -81,19 +80,13 @@ def test_delete_region_executes_on_dev(monkeypatch):
     assert result["dry_run"] is False
     assert result["before"]["regions"] == 66
     assert result["after"]["regions"] == 65
-    fake_sess.execute.assert_called_once()
 
 
 def test_delete_region_post_verify_fail(monkeypatch):
     _setup_state(env="DEV")
-    fake_sess = MagicMock()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.region_lifecycle.ImportSession",
-        lambda **kw: fake_sess,
-    )
-    monkeypatch.setattr(
-        "apex_builder_mcp.tools.region_lifecycle.query_workspace_id",
-        lambda profile, ws: 100002,
+        "apex_builder_mcp.tools.region_lifecycle.run_sqlcl",
+        _ok_sqlcl,
     )
     snap = MetadataSnapshot(pages=26, regions=66, items=41)
     snaps = iter([(snap, "DATA-LOADING"), (snap, "DATA-LOADING")])

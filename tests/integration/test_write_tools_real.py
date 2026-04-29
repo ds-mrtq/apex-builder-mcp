@@ -228,3 +228,192 @@ def test_add_item_dev_live_full_cycle(dev_state):
         )
     finally:
         _cleanup_probe_page(app_id, probe_page_id)
+
+
+# ---------------------------------------------------------------------------
+# 2B-1 lifecycle + bulk live DEV tests
+#
+# Probe ID range for 2B-1 lifecycle tests: 8500-8599 (avoids collision with
+# Plan 2A 8000-8499 + Phase 0 9000).
+# ---------------------------------------------------------------------------
+
+PROBE_LIFECYCLE_PAGE = 8500
+PROBE_LIFECYCLE_REGION = 8501
+PROBE_LIFECYCLE_ITEM = 8502
+
+
+def _add_probe_page_via_sqlcl(app_id: int) -> None:
+    """Use ImportSession directly to add a probe page (bypass MCP tool layer)."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  wwv_flow_imp_page.create_page("
+        f"p_id => {PROBE_LIFECYCLE_PAGE}, "
+        f"p_name => 'ITEST_PROBE_2B1', "
+        f"p_alias => 'ITEST_PROBE_2B1', "
+        f"p_step_title => 'ITEST_PROBE_2B1', "
+        f"p_autocomplete_on_off => 'OFF', "
+        f"p_page_template_options => '#DEFAULT#'"
+        f");\n"
+    )
+    sess.execute(body)
+
+
+def _cleanup_probe_lifecycle(app_id: int) -> None:
+    """Best-effort cleanup of any probe page id leftover from a failed test."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  begin wwv_flow_imp_page.remove_page("
+        f"p_flow_id => {app_id}, p_page_id => {PROBE_LIFECYCLE_PAGE}"
+        f"); exception when others then null; end;\n"
+    )
+    try:
+        sess.execute(body)
+    except Exception:
+        pass  # best-effort
+
+
+def test_delete_page_dev_live_full_cycle(dev_state):
+    """Live DEV: add probe page, then apex_delete_page, verify pages back to original."""
+    from apex_builder_mcp.tools.page_lifecycle import apex_delete_page
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_via_sqlcl(app_id)
+        result = apex_delete_page(app_id=app_id, page_id=PROBE_LIFECYCLE_PAGE)
+        assert result["dry_run"] is False
+        assert result["after"]["pages"] == result["before"]["pages"] - 1
+    finally:
+        _cleanup_probe_lifecycle(app_id)
+
+
+def test_delete_region_dev_live_full_cycle(dev_state):
+    """Live DEV: add probe page+region, then apex_delete_region."""
+    from apex_builder_mcp.tools.region_lifecycle import apex_delete_region
+    from apex_builder_mcp.tools.regions import apex_add_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_via_sqlcl(app_id)
+        apex_add_region(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            region_id=PROBE_LIFECYCLE_REGION,
+            name="ITEST_PROBE_REGION",
+        )
+        result = apex_delete_region(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            region_id=PROBE_LIFECYCLE_REGION,
+        )
+        assert result["dry_run"] is False
+        assert result["after"]["regions"] == result["before"]["regions"] - 1
+    finally:
+        _cleanup_probe_lifecycle(app_id)
+
+
+def test_delete_item_dev_live_full_cycle(dev_state):
+    """Live DEV: add probe page+region+item, then apex_delete_item."""
+    from apex_builder_mcp.tools.item_lifecycle import apex_delete_item
+    from apex_builder_mcp.tools.items import apex_add_item
+    from apex_builder_mcp.tools.regions import apex_add_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_via_sqlcl(app_id)
+        apex_add_region(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            region_id=PROBE_LIFECYCLE_REGION,
+            name="ITEST_REGION",
+        )
+        apex_add_item(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            item_id=PROBE_LIFECYCLE_ITEM,
+            region_id=PROBE_LIFECYCLE_REGION,
+            name=f"P{PROBE_LIFECYCLE_PAGE}_ITEST",
+        )
+        result = apex_delete_item(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            item_id=PROBE_LIFECYCLE_ITEM,
+        )
+        assert result["dry_run"] is False
+        assert result["after"]["items"] == result["before"]["items"] - 1
+    finally:
+        _cleanup_probe_lifecycle(app_id)
+
+
+def test_update_page_dev_live(dev_state):
+    """Live DEV: add probe page, update its name."""
+    from apex_builder_mcp.tools.page_lifecycle import apex_update_page
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_via_sqlcl(app_id)
+        result = apex_update_page(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            name="ITEST_PROBE_RENAMED",
+        )
+        assert result["dry_run"] is False
+        # Page count unchanged
+        assert result["after"]["pages"] == result["before"]["pages"]
+    finally:
+        _cleanup_probe_lifecycle(app_id)
+
+
+def test_update_item_dev_live(dev_state):
+    """update_item is deferred — verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.item_lifecycle import apex_update_item
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_update_item(app_id=100, page_id=8500, item_id=8502, label="x")
+    assert exc_info.value.code == "TOOL_DEFERRED"
+
+
+def test_bulk_add_items_dev_live(dev_state):
+    """Live DEV: add probe page+region, then bulk add 3 items in one ImportSession."""
+    from apex_builder_mcp.tools.items_bulk import apex_bulk_add_items
+    from apex_builder_mcp.tools.regions import apex_add_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_via_sqlcl(app_id)
+        apex_add_region(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            region_id=PROBE_LIFECYCLE_REGION,
+            name="ITEST_REGION",
+        )
+        items = [
+            {
+                "item_id": 8510 + i,
+                "name": f"P{PROBE_LIFECYCLE_PAGE}_BULK_{i}",
+                "display_as": "NATIVE_TEXT_FIELD",
+            }
+            for i in range(3)
+        ]
+        result = apex_bulk_add_items(
+            app_id=app_id,
+            page_id=PROBE_LIFECYCLE_PAGE,
+            region_id=PROBE_LIFECYCLE_REGION,
+            items=items,
+        )
+        assert result["dry_run"] is False
+        assert result["after"]["items"] == result["before"]["items"] + 3
+    finally:
+        _cleanup_probe_lifecycle(app_id)

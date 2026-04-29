@@ -6,26 +6,27 @@ a full page snapshot (out of scope for Bundle 2).
 
 Per Phase 0 discovery (ALL_ARGUMENTS):
   * wwv_flow_app_builder_api.delete_region(p_page_id, p_region_id)
+
+NOTE: app_builder_api procs do NOT need ImportSession context. They are
+public APEX management procs that work outside an import session, but they
+require the apex_240200.* schema prefix.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from apex_builder_mcp.apex_api.import_session import ImportSession
 from apex_builder_mcp.audit.auto_export import refresh_export
 from apex_builder_mcp.audit.post_write_verify import (
     verify_post_fail,
     verify_post_success,
 )
+from apex_builder_mcp.connection.sqlcl_subprocess import has_db_error, run_sqlcl
 from apex_builder_mcp.connection.state import get_state
 from apex_builder_mcp.guard.policy import PolicyContext, enforce_policy
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
-from apex_builder_mcp.tools._write_helpers import (
-    query_metadata_snapshot,
-    query_workspace_id,
-)
+from apex_builder_mcp.tools._write_helpers import query_metadata_snapshot
 
 
 @apex_tool(name="apex_delete_region", category=Category.WRITE_CORE)
@@ -36,8 +37,8 @@ def apex_delete_region(
 ) -> dict[str, Any]:
     """Delete a region via wwv_flow_app_builder_api.delete_region. DEV-only.
 
-    The APEX proc only takes p_page_id + p_region_id; app_id is required for
-    the ImportSession context (workspace + flow scoping) and metadata snapshot.
+    NOTE: app_builder_api procs do NOT need ImportSession context. Called
+    directly with apex_240200.* schema prefix.
     """
     state = get_state()
     if state.profile is None:
@@ -48,11 +49,21 @@ def apex_delete_region(
         )
     profile = state.profile
 
-    plsql_body = (
-        f"  wwv_flow_app_builder_api.delete_region("
-        f"p_page_id => {page_id}, "
-        f"p_region_id => {region_id}"
-        f");\n"
+    sql = (
+        f"set echo off feedback on define off verify off\n"
+        f"whenever sqlerror exit sql.sqlcode rollback\n"
+        f"begin\n"
+        f"  apex_util.set_workspace(p_workspace => '{profile.workspace}');\n"
+        f"  apex_240200.wwv_flow_app_builder_api.set_application_id("
+        f"p_application_id => {app_id});\n"
+        f"  apex_240200.wwv_flow_app_builder_api.delete_region(\n"
+        f"    p_page_id => {page_id},\n"
+        f"    p_region_id => {region_id}\n"
+        f"  );\n"
+        f"  commit;\n"
+        f"end;\n"
+        f"/\n"
+        f"exit\n"
     )
 
     decision = enforce_policy(
@@ -68,31 +79,20 @@ def apex_delete_region(
             "app_id": app_id,
             "page_id": page_id,
             "region_id": region_id,
-            "sql_preview": (
-                f"-- import_begin/import_end wrap for app {app_id}\n"
-                f"-- body:\n{plsql_body}"
-            ),
+            "sql_preview": sql,
         }
 
-    ws_id = query_workspace_id(profile, profile.workspace)
     before, alias_resolved = query_metadata_snapshot(profile, app_id)
 
-    sess = ImportSession(
-        sqlcl_conn=profile.sqlcl_name,
-        workspace_id=ws_id,
-        application_id=app_id,
-        schema=profile.workspace,
-    )
-    try:
-        sess.execute(plsql_body)
-    except Exception as e:
+    result = run_sqlcl(profile.sqlcl_name, sql, timeout=60)
+    if result.rc != 0 or has_db_error(result.stdout):
         after_fail, _ = query_metadata_snapshot(profile, app_id)
         verify_post_fail(before, after_fail)
         raise ApexBuilderError(
             code="WRITE_EXEC_FAIL",
-            message=f"apex_delete_region failed: {e}",
-            suggestion="Check SQL preview via dry_run",
-        ) from e
+            message=f"apex_delete_region failed: {result.cleaned}",
+            suggestion="Verify region_id exists; check app_builder_api signature",
+        )
 
     after, _ = query_metadata_snapshot(profile, app_id)
     ok, reason = verify_post_success(before, after, expected_delta={"regions": -1})
