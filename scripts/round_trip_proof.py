@@ -137,7 +137,10 @@ begin
   wwv_flow_imp_page.create_page(
     p_id => {PROBE_PAGE_ID},
     p_name => '{PROBE_NAME}',
-    p_step_title => '{PROBE_NAME}'
+    p_alias => '{PROBE_NAME}',
+    p_step_title => '{PROBE_NAME}',
+    p_autocomplete_on_off => 'OFF',
+    p_page_template_options => '#DEFAULT#'
   );
   wwv_flow_imp_page.create_page_plug(
     p_id => {PROBE_REGION_ID},
