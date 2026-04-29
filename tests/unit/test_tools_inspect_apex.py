@@ -6,8 +6,12 @@ from apex_builder_mcp.tools.inspect_apex import (
     apex_describe_acl,
     apex_describe_app,
     apex_describe_page,
+    apex_describe_page_human,
+    apex_get_page_details,
     apex_list_apps,
+    apex_list_items,
     apex_list_pages,
+    apex_list_regions,
 )
 
 
@@ -106,3 +110,107 @@ def test_describe_acl(monkeypatch):
     result = apex_describe_acl(app_id=100)
     assert result["count"] == 2
     assert result["assignments"][0]["user_name"] == "CONGNC"
+
+
+def test_get_page_details_returns_full(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchone.return_value = (
+        "Home", "HOME", "STANDARD", "Y",
+        "page_func", 1234, "navlist",
+        None, "Desktop", "css", "js", "#DEFAULT#",
+    )
+    fake_cur.description = [
+        ("PAGE_NAME", None, None, None, None, None, None),
+        ("PAGE_ALIAS", None, None, None, None, None, None),
+        ("PAGE_MODE", None, None, None, None, None, None),
+        ("REQUIRES_AUTHENTICATION", None, None, None, None, None, None),
+        ("PAGE_FUNCTION", None, None, None, None, None, None),
+        ("PAGE_TEMPLATE", None, None, None, None, None, None),
+        ("PRIMARY_NAVIGATION_LIST", None, None, None, None, None, None),
+        ("SECURITY_AUTHORIZATION_SCHEME", None, None, None, None, None, None),
+        ("PRIMARY_USER_INTERFACE", None, None, None, None, None, None),
+        ("INLINE_CSS", None, None, None, None, None, None),
+        ("JAVASCRIPT_CODE_ONLOAD", None, None, None, None, None, None),
+        ("PAGE_TEMPLATE_OPTIONS", None, None, None, None, None, None),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_get_page_details(app_id=100, page_id=1)
+    assert result["found"] is True
+    assert result["details"]["PAGE_NAME"] == "Home"
+
+
+def test_get_page_details_not_found(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchone.return_value = None
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_get_page_details(app_id=999, page_id=1)
+    assert result["found"] is False
+
+
+def test_describe_page_human_returns_markdown(monkeypatch):
+    # Mock apex_describe_page to return synthetic page
+    def fake_describe(app_id, page_id):
+        return {
+            "app_id": 100, "page_id": 1, "found": True,
+            "page_name": "Home", "page_alias": "HOME", "page_mode": "STANDARD",
+            "requires_authentication": "Y",
+            "regions": [{"region_id": 1000, "name": "Hero", "position": "BODY", "sequence": 10}],
+            "items": [{"item_id": 2000, "name": "P1_X", "display_as": "TEXT", "region_id": 1000}],
+            "buttons": [{"button_id": 3000, "name": "OK", "region_id": 1000, "action": "SUBMIT"}],
+            "processes": [{"process_id": 4000, "name": "PROC", "type": "PLSQL", "sequence": 10}],
+        }
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex.apex_describe_page", fake_describe
+    )
+    result = apex_describe_page_human(app_id=100, page_id=1)
+    assert result["found"] is True
+    assert "# Page 1: Home" in result["summary"]
+    assert "Hero" in result["summary"]
+    assert "P1_X" in result["summary"]
+
+
+def test_list_regions(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        (1000, "Hero", "BODY", 10, "t-Region", None, "STATIC"),
+        (1001, "Body", "BODY", 20, "t-Region", "select 1 from dual", "QUERY"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_regions(app_id=100, page_id=1)
+    assert result["count"] == 2
+    assert result["regions"][0]["region_name"] == "Hero"
+
+
+def test_list_items(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        (2000, "P1_X", "TEXT", 1000, 10, "X label", "X prompt"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_items(app_id=100, page_id=1)
+    assert result["count"] == 1
+    assert result["items"][0]["name"] == "P1_X"

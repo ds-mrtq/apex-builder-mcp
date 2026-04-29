@@ -181,3 +181,134 @@ def apex_describe_acl(app_id: int) -> dict[str, Any]:
             for r in cur.fetchall()
         ]
     return {"app_id": app_id, "assignments": rows, "count": len(rows)}
+
+
+@apex_tool(name="apex_get_page_details", category=Category.READ_APEX)
+def apex_get_page_details(app_id: int, page_id: int) -> dict[str, Any]:
+    """Full page metadata from apex_application_pages."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            select page_name, page_alias, page_mode, requires_authentication,
+                   page_function, page_template, primary_navigation_list,
+                   security_authorization_scheme, primary_user_interface,
+                   inline_css, javascript_code_onload, page_template_options
+              from apex_application_pages
+             where application_id = :a and page_id = :p
+            """,
+            a=app_id, p=page_id,
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"app_id": app_id, "page_id": page_id, "found": False}
+        cols = [d[0] for d in cur.description]
+    details = dict(zip(cols, row, strict=False))
+    return {"app_id": app_id, "page_id": page_id, "found": True, "details": details}
+
+
+@apex_tool(name="apex_describe_page_human", category=Category.READ_APEX)
+def apex_describe_page_human(app_id: int, page_id: int) -> dict[str, Any]:
+    """Human-readable Markdown summary of a page (for LLM context)."""
+    page_data = apex_describe_page(app_id, page_id)
+    if not page_data.get("found", True) or page_data.get("page_name") is None:
+        return {"app_id": app_id, "page_id": page_id, "found": False, "summary": ""}
+
+    lines = [
+        f"# Page {page_id}: {page_data['page_name']}",
+        f"- Alias: {page_data.get('page_alias') or '(none)'}",
+        f"- Mode: {page_data.get('page_mode')}",
+        f"- Requires authentication: {page_data.get('requires_authentication')}",
+        "",
+        f"## Regions ({len(page_data.get('regions', []))})",
+    ]
+    for r in page_data.get("regions", []):
+        lines.append(
+            f"- [{r['region_id']}] {r['name']} "
+            f"(position={r['position']}, seq={r['sequence']})"
+        )
+    lines.append("")
+    lines.append(f"## Items ({len(page_data.get('items', []))})")
+    for it in page_data.get("items", []):
+        lines.append(
+            f"- [{it['item_id']}] {it['name']} ({it['display_as']}) "
+            f"in region {it['region_id']}"
+        )
+    lines.append("")
+    lines.append(f"## Buttons ({len(page_data.get('buttons', []))})")
+    for b in page_data.get("buttons", []):
+        lines.append(f"- [{b['button_id']}] {b['name']} action={b['action']}")
+    lines.append("")
+    lines.append(f"## Processes ({len(page_data.get('processes', []))})")
+    for pr in page_data.get("processes", []):
+        lines.append(f"- [{pr['process_id']}] {pr['name']} type={pr['type']}")
+
+    return {
+        "app_id": app_id,
+        "page_id": page_id,
+        "found": True,
+        "summary": "\n".join(lines),
+    }
+
+
+@apex_tool(name="apex_list_regions", category=Category.READ_APEX)
+def apex_list_regions(app_id: int, page_id: int) -> dict[str, Any]:
+    """List regions of a page with display sequence + template info."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            select region_id, region_name, display_position, display_sequence,
+                   region_template, source, source_type
+              from apex_application_page_regions
+             where application_id = :a and page_id = :p
+             order by display_sequence
+            """,
+            a=app_id, p=page_id,
+        )
+        rows = [
+            {
+                "region_id": r[0],
+                "region_name": r[1],
+                "position": r[2],
+                "sequence": r[3],
+                "template": r[4],
+                "source": r[5],
+                "source_type": r[6],
+            }
+            for r in cur.fetchall()
+        ]
+    return {"app_id": app_id, "page_id": page_id, "regions": rows, "count": len(rows)}
+
+
+@apex_tool(name="apex_list_items", category=Category.READ_APEX)
+def apex_list_items(app_id: int, page_id: int) -> dict[str, Any]:
+    """List items of a page with display attributes."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            select item_id, item_name, display_as, item_plug_id,
+                   item_sequence, label, prompt
+              from apex_application_page_items
+             where application_id = :a and page_id = :p
+             order by item_sequence
+            """,
+            a=app_id, p=page_id,
+        )
+        rows = [
+            {
+                "item_id": r[0],
+                "name": r[1],
+                "display_as": r[2],
+                "region_id": r[3],
+                "sequence": r[4],
+                "label": r[5],
+                "prompt": r[6],
+            }
+            for r in cur.fetchall()
+        ]
+    return {"app_id": app_id, "page_id": page_id, "items": rows, "count": len(rows)}
