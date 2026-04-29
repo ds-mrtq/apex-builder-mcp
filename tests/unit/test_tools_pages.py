@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from apex_builder_mcp.audit.post_write_verify import MetadataSnapshot
 from apex_builder_mcp.connection.state import get_state, reset_state_for_tests
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
@@ -55,20 +56,19 @@ def test_add_page_executes_on_dev(monkeypatch):
     monkeypatch.setattr(
         "apex_builder_mcp.tools.pages.ImportSession", lambda **kw: fake_sess
     )
-
-    fake_cur = MagicMock()
-    # Order of fetchone calls: workspace_id, before snapshot, after snapshot
-    fake_cur.fetchone.side_effect = [
-        (100002,),
-        (25, 66, 41, "DATA-LOADING"),
-        (26, 66, 41, "DATA-LOADING"),
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.pages._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.pages.query_workspace_id",
+        lambda profile, workspace: 100002,
+    )
+    snapshot_calls = iter(
+        [
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+            (MetadataSnapshot(pages=26, regions=66, items=41), "DATA-LOADING"),
+        ]
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.pages.query_metadata_snapshot",
+        lambda profile, app_id: next(snapshot_calls),
     )
     monkeypatch.setattr(
         "apex_builder_mcp.tools.pages.refresh_export",
@@ -91,19 +91,19 @@ def test_add_page_post_success_verify_fail(monkeypatch):
     monkeypatch.setattr(
         "apex_builder_mcp.tools.pages.ImportSession", lambda **kw: fake_sess
     )
-
-    fake_cur = MagicMock()
-    fake_cur.fetchone.side_effect = [
-        (100002,),
-        (25, 66, 41, "DATA-LOADING"),
-        (25, 66, 41, "DATA-LOADING"),  # didn't change!
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.pages._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.pages.query_workspace_id",
+        lambda profile, workspace: 100002,
+    )
+    snapshot_calls = iter(
+        [
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+        ]
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.pages.query_metadata_snapshot",
+        lambda profile, app_id: next(snapshot_calls),
     )
 
     with pytest.raises(ApexBuilderError) as exc_info:
@@ -114,14 +114,21 @@ def test_add_page_post_success_verify_fail(monkeypatch):
 def test_add_page_app_not_found_raises(monkeypatch):
     _setup_state(env="DEV")
 
-    fake_cur = MagicMock()
-    fake_cur.fetchone.side_effect = [(100002,), None]  # workspace_id ok, but app not found
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.pages._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.pages.query_workspace_id",
+        lambda profile, workspace: 100002,
+    )
+
+    def _raise_app_not_found(profile, app_id):
+        raise ApexBuilderError(
+            code="APP_NOT_FOUND",
+            message=f"application_id={app_id} not found",
+            suggestion="Verify with apex_list_apps",
+        )
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.pages.query_metadata_snapshot",
+        _raise_app_not_found,
     )
 
     with pytest.raises(ApexBuilderError) as exc_info:

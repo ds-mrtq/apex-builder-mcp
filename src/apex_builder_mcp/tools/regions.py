@@ -6,7 +6,6 @@ from typing import Any
 from apex_builder_mcp.apex_api.import_session import ImportSession
 from apex_builder_mcp.audit.auto_export import refresh_export
 from apex_builder_mcp.audit.post_write_verify import (
-    MetadataSnapshot,
     verify_post_fail,
     verify_post_success,
 )
@@ -15,52 +14,10 @@ from apex_builder_mcp.guard.policy import PolicyContext, enforce_policy
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
-
-
-def _get_pool() -> Any:
-    from apex_builder_mcp.tools.connection import _get_or_create_pool
-    return _get_or_create_pool()
-
-
-def _query_workspace_id(conn: Any, workspace: str) -> int:
-    cur = conn.cursor()
-    cur.execute(
-        "select workspace_id from apex_workspaces where upper(workspace) = :w",
-        w=workspace.upper(),
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise ApexBuilderError(
-            code="WORKSPACE_NOT_FOUND",
-            message=f"workspace {workspace!r} not found",
-            suggestion="Verify workspace via apex_describe_app",
-        )
-    return int(row[0])
-
-
-def _snapshot(conn: Any, app_id: int) -> tuple[MetadataSnapshot, str]:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        select pages,
-               (select count(*) from apex_application_page_regions where application_id = :a),
-               (select count(*) from apex_application_page_items where application_id = :a),
-               alias
-          from apex_applications where application_id = :a
-        """,
-        a=app_id,
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise ApexBuilderError(
-            code="APP_NOT_FOUND",
-            message=f"application_id={app_id} not found",
-            suggestion="Verify with apex_list_apps",
-        )
-    return (
-        MetadataSnapshot(pages=int(row[0]), regions=int(row[1]), items=int(row[2])),
-        str(row[3]) if row[3] else "",
-    )
+from apex_builder_mcp.tools._write_helpers import (
+    query_metadata_snapshot,
+    query_workspace_id,
+)
 
 
 @apex_tool(name="apex_add_region", category=Category.WRITE_CORE)
@@ -86,6 +43,8 @@ def apex_add_region(
 
     plsql_body = f"""  wwv_flow_imp_page.create_page_plug(
     p_id => {region_id},
+    p_flow_id => {app_id},
+    p_page_id => {page_id},
     p_plug_name => '{name}',
     p_plug_template => {template_id},
     p_plug_display_sequence => {display_sequence},
@@ -109,10 +68,8 @@ def apex_add_region(
             ),
         }
 
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        ws_id = _query_workspace_id(conn, profile.workspace)
-        before, alias = _snapshot(conn, app_id)
+    ws_id = query_workspace_id(profile, profile.workspace)
+    before, alias = query_metadata_snapshot(profile, app_id)
 
     sess = ImportSession(
         sqlcl_conn=profile.sqlcl_name,
@@ -123,8 +80,7 @@ def apex_add_region(
     try:
         sess.execute(plsql_body)
     except Exception as e:
-        with pool.acquire() as conn:
-            after_fail, _ = _snapshot(conn, app_id)
+        after_fail, _ = query_metadata_snapshot(profile, app_id)
         verify_post_fail(before, after_fail)
         raise ApexBuilderError(
             code="WRITE_EXEC_FAIL",
@@ -132,8 +88,7 @@ def apex_add_region(
             suggestion="Check SQL preview via dry_run",
         ) from e
 
-    with pool.acquire() as conn:
-        after, _ = _snapshot(conn, app_id)
+    after, _ = query_metadata_snapshot(profile, app_id)
     ok, reason = verify_post_success(before, after, expected_delta={"regions": 1})
     if not ok:
         raise ApexBuilderError(

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from apex_builder_mcp.audit.post_write_verify import MetadataSnapshot
 from apex_builder_mcp.connection.state import get_state, reset_state_for_tests
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
@@ -60,18 +61,19 @@ def test_add_region_executes_on_dev(monkeypatch):
     monkeypatch.setattr(
         "apex_builder_mcp.tools.regions.ImportSession", lambda **kw: fake_sess
     )
-    fake_cur = MagicMock()
-    fake_cur.fetchone.side_effect = [
-        (100002,),
-        (25, 66, 41, "DATA-LOADING"),
-        (25, 67, 41, "DATA-LOADING"),
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.regions._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.regions.query_workspace_id",
+        lambda profile, workspace: 100002,
+    )
+    snapshot_calls = iter(
+        [
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+            (MetadataSnapshot(pages=25, regions=67, items=41), "DATA-LOADING"),
+        ]
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.regions.query_metadata_snapshot",
+        lambda profile, app_id: next(snapshot_calls),
     )
     monkeypatch.setattr(
         "apex_builder_mcp.tools.regions.refresh_export",
@@ -93,18 +95,19 @@ def test_add_region_post_success_verify_fail(monkeypatch):
     monkeypatch.setattr(
         "apex_builder_mcp.tools.regions.ImportSession", lambda **kw: fake_sess
     )
-    fake_cur = MagicMock()
-    fake_cur.fetchone.side_effect = [
-        (100002,),
-        (25, 66, 41, "DATA-LOADING"),
-        (25, 66, 41, "DATA-LOADING"),  # didn't change
-    ]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.regions._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.regions.query_workspace_id",
+        lambda profile, workspace: 100002,
+    )
+    snapshot_calls = iter(
+        [
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+            (MetadataSnapshot(pages=25, regions=66, items=41), "DATA-LOADING"),
+        ]
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.regions.query_metadata_snapshot",
+        lambda profile, app_id: next(snapshot_calls),
     )
 
     with pytest.raises(ApexBuilderError) as exc_info:
