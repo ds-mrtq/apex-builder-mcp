@@ -8,6 +8,7 @@ from apex_builder_mcp.registry.tool_decorator import get_registered_tools
 # Import tool modules so @apex_tool decorators populate _REGISTERED_TOOLS.
 # All tool modules must be imported here for the registry to know about them
 # at server build time; the lazy loader then exposes them per category.
+from apex_builder_mcp.tools import apps as _apps  # noqa: F401
 from apex_builder_mcp.tools import audit as _audit  # noqa: F401
 from apex_builder_mcp.tools import buttons as _buttons  # noqa: F401
 from apex_builder_mcp.tools import (

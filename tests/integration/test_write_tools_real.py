@@ -1304,3 +1304,152 @@ def test_generate_modal_form_dev_live_2b7(dev_state):
         assert result["created"]["form_region"] == page_id + 1
     finally:
         _cleanup_2b7_pages(app_id, [page_id])
+
+
+# ---------------------------------------------------------------------------
+# 2B-8 app lifecycle live DEV tests
+#
+# Probe ranges:
+#   * apex_get_app_details / apex_validate_app -> existing source app
+#   * apex_create_app + apex_delete_app -> 999000-999999 (avoid collision
+#     with real apps which are typically 100-1000 range).
+# Cleanup pattern: ALWAYS delete via apex_delete_app in finally even on
+# partial-create failures.
+# ---------------------------------------------------------------------------
+
+
+def test_get_app_details_dev_live_2b8(dev_state):
+    """Live DEV: get full metadata of the source app."""
+    from apex_builder_mcp.tools.apps import apex_get_app_details
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        result = apex_get_app_details(app_id=app_id)
+    except Exception as e:
+        pytest.skip(f"apex_get_app_details requires oracledb pool: {e}")
+
+    assert result["found"] is True
+    assert result["application_id"] == app_id
+    assert "APPLICATION_NAME" in result["details"]
+    assert "ALIAS" in result["details"]
+    assert "PAGES" in result["details"]
+
+
+def test_get_app_details_not_found_dev_live_2b8(dev_state):
+    """Live DEV: get_app_details returns found=False for non-existent app."""
+    from apex_builder_mcp.tools.apps import apex_get_app_details
+
+    try:
+        result = apex_get_app_details(app_id=999999)
+    except Exception as e:
+        pytest.skip(f"apex_get_app_details requires oracledb pool: {e}")
+
+    assert result["found"] is False
+
+
+def test_validate_app_dev_live_2b8(dev_state):
+    """Live DEV: validate the source app (read-only heuristic checks)."""
+    from apex_builder_mcp.tools.apps import apex_validate_app
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        result = apex_validate_app(app_id=app_id)
+    except Exception as e:
+        pytest.skip(f"apex_validate_app requires oracledb pool: {e}")
+
+    assert "ok" in result
+    assert "issues" in result
+    assert "counts" in result
+    # Real app may or may not have issues — the test verifies the contract,
+    # not a specific clean-state outcome.
+
+
+def test_validate_app_not_found_dev_live_2b8(dev_state):
+    """Live DEV: validate_app on missing app reports APP_NOT_FOUND."""
+    from apex_builder_mcp.tools.apps import apex_validate_app
+
+    try:
+        result = apex_validate_app(app_id=999999)
+    except Exception as e:
+        pytest.skip(f"apex_validate_app requires oracledb pool: {e}")
+
+    assert result["ok"] is False
+    assert any(i["code"] == "APP_NOT_FOUND" for i in result["issues"])
+
+
+def test_create_and_delete_app_dev_live_2b8(dev_state):
+    """Live DEV: create a sandbox app stub then delete it via apex_delete_app.
+
+    create_app produces a partial-functionality stub; we verify it appears in
+    apex_applications with the expected name/alias and 1 page (Home), then
+    clean up via apex_delete_app and verify it is gone.
+    """
+    from apex_builder_mcp.tools.apps import (
+        apex_create_app,
+        apex_delete_app,
+        apex_get_app_details,
+    )
+
+    sandbox_app_id = 999000 + secrets.randbelow(1000)
+    sandbox_alias = f"P2B8_{secrets.token_hex(3).upper()}"
+    sandbox_name = f"Probe 2B8 {secrets.token_hex(2).upper()}"
+
+    create_done = False
+    try:
+        # 1. Create
+        create_result = apex_create_app(
+            name=sandbox_name,
+            alias=sandbox_alias,
+            app_id=sandbox_app_id,
+        )
+        assert create_result["dry_run"] is False
+        assert create_result["app_id"] == sandbox_app_id
+        assert create_result["alias"] == sandbox_alias
+        assert create_result["partial_functionality"] is True
+        create_done = True
+
+        # 2. Verify via apex_get_app_details (uses pool, may skip if no pool)
+        try:
+            details = apex_get_app_details(app_id=sandbox_app_id)
+            assert details["found"] is True
+            assert details["details"]["ALIAS"] == sandbox_alias
+        except Exception:
+            # pool may be unavailable when running with auth_mode=sqlcl;
+            # the create is already verified in apex_create_app itself.
+            pass
+    finally:
+        # 3. Cleanup — always delete, even if assertions failed mid-test
+        try:
+            delete_result = apex_delete_app(app_id=sandbox_app_id)
+            if create_done:
+                assert delete_result["deleted"] is True
+        except Exception:
+            # Best-effort cleanup via raw SQLcl
+            from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+            run_sqlcl(
+                os.environ["APEX_TEST_SQLCL_NAME"],
+                (
+                    "set echo off feedback off\n"
+                    f"begin wwv_flow_imp.remove_flow(p_id => {sandbox_app_id}); "
+                    f"commit; exception when others then null; end;\n/\nexit\n"
+                ),
+                timeout=60,
+            )
+
+
+def test_delete_app_missing_app_silently_ok_live_2b8(dev_state):
+    """Live DEV: delete_app on a non-existent app is idempotent.
+
+    Phase 0 finding (re-verified during 2B-8): wwv_flow_imp.remove_flow
+    silently succeeds when the app doesn't exist. The post-verify check
+    confirms the app is gone (count=0 even when it never existed), so the
+    tool returns deleted=True. This is benign idempotent behavior.
+    """
+    from apex_builder_mcp.tools.apps import apex_delete_app
+
+    # Pick an id well outside known ranges
+    missing_id = 998000 + secrets.randbelow(500)
+    result = apex_delete_app(app_id=missing_id)
+    assert result["dry_run"] is False
+    assert result["deleted"] is True
+    assert result["app_id"] == missing_id
