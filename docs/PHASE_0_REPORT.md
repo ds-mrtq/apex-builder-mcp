@@ -488,3 +488,75 @@ Plan 2A first-task scope (informed by findings 1-9 above):
   "overall": "PASS"
 }
 ```
+
+
+## Gate 5 In-Place Probe Findings (Option C)
+
+```json
+{
+  "timestamp": "2026-04-29T05:05:53.226283+00:00",
+  "strategy": "in-place probe (Option C)",
+  "sqlcl_conn": "ereport_test8001",
+  "workspace": "EREPORT",
+  "schema": "EREPORT",
+  "app_id": 100,
+  "probe_ids": {
+    "page": 8000,
+    "region": 8001,
+    "item": 8002
+  },
+  "steps": [
+    {
+      "step": "source_meta",
+      "status": "ok",
+      "metadata": {
+        "pages": 25,
+        "regions": 66,
+        "items": 41,
+        "alias": "DATA-LOADING"
+      }
+    },
+    {
+      "step": "add_probe",
+      "status": "ok",
+      "metadata": {
+        "pages": 26,
+        "regions": 67,
+        "items": 42,
+        "alias": "DATA-LOADING"
+      }
+    },
+    {
+      "step": "export",
+      "status": "ok",
+      "file": "C:\\Users\\nguye\\AppData\\Local\\Temp\\apex_phase0_100\\f100.sql",
+      "size": 589865
+    },
+    {
+      "step": "export_contains_probe",
+      "status": "ok"
+    },
+    {
+      "step": "runtime_open",
+      "status": "ok",
+      "detail": "https://apexdev.vicemhatien.com.vn/ords/r/ereport/data-loading/8000 -> 302 -> https://apexdev.vicemhatien.com.vn/ords/r/ereport/data-loading/login?session=9219184856052 (auth redirect = page registered)"
+    },
+    {
+      "step": "remove_probe",
+      "status": "ok",
+      "metadata": {
+        "pages": 25,
+        "regions": 66,
+        "items": 41,
+        "alias": "DATA-LOADING"
+      }
+    },
+    {
+      "step": "final_integrity",
+      "status": "ok"
+    }
+  ],
+  "workspace_id": 100002,
+  "overall": "PASS"
+}
+```

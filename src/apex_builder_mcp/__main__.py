@@ -5,10 +5,18 @@ from fastmcp import FastMCP
 
 from apex_builder_mcp.registry.tool_decorator import get_registered_tools
 
-# Import tool modules so decorators register them
+# Import tool modules so @apex_tool decorators populate _REGISTERED_TOOLS.
+# All 9 tool modules must be imported here for the registry to know about them
+# at server build time; the lazy loader then exposes them per category.
 from apex_builder_mcp.tools import audit as _audit  # noqa: F401
 from apex_builder_mcp.tools import connection as _conn  # noqa: F401
+from apex_builder_mcp.tools import inspect_apex as _inspect_apex  # noqa: F401
+from apex_builder_mcp.tools import inspect_db as _inspect_db  # noqa: F401
+from apex_builder_mcp.tools import items as _items  # noqa: F401
+from apex_builder_mcp.tools import layout_spec as _layout_spec  # noqa: F401
 from apex_builder_mcp.tools import lazy as _lazy  # noqa: F401
+from apex_builder_mcp.tools import pages as _pages  # noqa: F401
+from apex_builder_mcp.tools import regions as _regions  # noqa: F401
 from apex_builder_mcp.tools.lazy import _get_loader
 
 
