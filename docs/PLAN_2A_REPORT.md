@@ -13,9 +13,9 @@ T1-T20 (20 tasks). All shipped via TDD with single commit per task + push to ori
 | Layer | Count | Status |
 |---|---|---|
 | Unit tests | 180 | PASS |
-| Integration tests (with --integration) | 7 active + 6 skipped | PASS (active subset; skipped require live DB pool / live DEV write) |
+| Integration tests (with --integration) | 11 active + 4 skipped | PASS (live DEV writes verified end-to-end via SQLcl auth) |
 | ruff | clean | PASS |
-| mypy | clean (45 source files) | PASS |
+| mypy | clean (46 source files) | PASS |
 
 ### Integration test breakdown
 
@@ -23,7 +23,7 @@ T1-T20 (20 tasks). All shipped via TDD with single commit per task + push to ori
 tests/integration/test_id_allocator_real.py::test_dbms_lock_acquire_release SKIPPED
 tests/integration/test_keyring_real.py::test_keyring_round_trip PASSED
 tests/integration/test_layout_spec_real.py::test_layout_spec_dry_run PASSED
-tests/integration/test_layout_spec_real.py::test_layout_spec_dev_live SKIPPED
+tests/integration/test_layout_spec_real.py::test_layout_spec_dev_live PASSED
 tests/integration/test_pool_real.py::test_real_connect_and_query SKIPPED
 tests/integration/test_round_trip.py::test_round_trip_proof SKIPPED
 tests/integration/test_sqlcl_metadata_real.py::test_read_real_sqlcl_connection PASSED
@@ -31,10 +31,12 @@ tests/integration/test_sqlcl_metadata_real.py::test_read_via_connmgr_real PASSED
 tests/integration/test_write_tools_real.py::test_add_page_dry_run_via_real_state PASSED
 tests/integration/test_write_tools_real.py::test_add_region_dry_run_via_real_state PASSED
 tests/integration/test_write_tools_real.py::test_add_item_dry_run_via_real_state PASSED
-tests/integration/test_write_tools_real.py::test_add_page_dev_live_full_cycle SKIPPED
+tests/integration/test_write_tools_real.py::test_add_page_dev_live_full_cycle PASSED
+tests/integration/test_write_tools_real.py::test_add_region_dev_live_full_cycle PASSED
+tests/integration/test_write_tools_real.py::test_add_item_dev_live_full_cycle PASSED
 tests/integration/test_wwv_calls_real.py::test_5_sample_calls_succeed SKIPPED
 
-7 passed, 6 skipped in 9.19s
+11 passed, 4 skipped in 254.05s
 ```
 
 ## MVP tools delivered (26 expected)
@@ -129,29 +131,26 @@ Growth pattern: 13 → 22 (+9 read auto-load) → 25 (+3 write_core) → 26 (+1 
 | 9 | Auto-export hook | PASS (unit-tested; live deferred) |
 | 10 | Skills (Claude Code + Codex) shipped | PASS (in oracle-apex-skill-builder repo) |
 | 11 | Workspace template + docs | PASS |
-| 12 | Live DEV write end-to-end via MCP tools | PARTIAL (see known limitation) |
+| 12 | Live DEV write end-to-end via MCP tools | PASS (resolved in mvp-1.0 via shared `tools/_write_helpers.py` SQLcl-subprocess fallback) |
 
-## Known limitation: live DEV write needs oracledb pool
+## Pool-gap fix (mvp-1.0)
 
-**Issue**: Write tools (`apex_add_page/region/item`, `apex_apply_layout_spec`) call `_query_workspace_id` and `_snapshot` via the oracledb pool for read queries. With `auth_mode=sqlcl` (the primary/default path), no oracledb pool is configured, so these reads fail.
+**Issue**: Write tools (`apex_add_page/region/item`, `apex_apply_layout_spec`) called `_query_workspace_id` and `_snapshot` via the oracledb pool for read queries. With `auth_mode=sqlcl` (the primary/default path), no oracledb pool is configured, so these reads previously failed.
 
-**Current mitigation**:
-- TEST-environment dry-run paths work end-to-end (no oracledb needed; just renders SQL)
-- Phase 0 `scripts/round_trip_proof.py` uses SQLcl subprocess for everything and proves the underlying API path works
-- Unit tests mock the pool and verify all tool logic (180 unit tests)
+**Resolution**: Introduced shared module `src/apex_builder_mcp/tools/_write_helpers.py` exporting `query_workspace_id(profile, workspace)` and `query_metadata_snapshot(profile, app_id)`. Both functions branch on `resolve_auth_mode(profile)`:
 
-**Resolution path** (Plan 2A.next):
-1. Refactor `_query_workspace_id` and `_snapshot` helpers to use SQLcl subprocess when `auth_mode=sqlcl`
-2. Update integration tests to drop the skip marker
-3. Re-tag as `mvp-1.0` once verified
+  * `auth_mode=sqlcl`    → reads via `run_sqlcl` subprocess (no oracledb pool needed)
+  * `auth_mode=password` → reads via the existing oracledb pool
 
-**Effort estimate**: ~30 minutes of focused work to add SQLcl-subprocess-only fallback for the 2 read helpers shared across 3 write tools.
+`tools/pages.py`, `tools/regions.py`, `tools/items.py` were refactored to use the shared helpers (3 copies of `_get_pool` / `_query_workspace_id` / `_snapshot` removed). Unit tests now monkeypatch the shared helpers directly.
+
+Live DEV integration tests were added/un-skipped: `test_add_page_dev_live_full_cycle`, `test_add_region_dev_live_full_cycle`, `test_add_item_dev_live_full_cycle`, `test_layout_spec_dev_live`. Each test creates a probe page on app 100, verifies the metadata delta, and cleans up via SQLcl heredoc using the Phase 0-verified `import_begin` + `remove_page` + `import_end` pattern.
+
+Side fix: `apex_add_region` and `apex_add_item` were updated to pass `p_flow_id` + `p_page_id` (region) / `p_flow_id` + `p_flow_step_id` (item) to satisfy the WWV_FLOW_PAGE_PLUGS NOT NULL constraint when called against an existing page in a fresh import session.
 
 ## Versioning
 
-This release is tagged `mvp-0.9-pool-gap` to reflect: all DoD met EXCEPT live DEV write (criterion 12 PARTIAL).
-
-After the pool-gap fix lands, tag `mvp-1.0`.
+`mvp-0.9-pool-gap` was retagged to `mvp-1.0` after live DEV writes verified end-to-end via SQLcl auth.
 
 ## Files / commits summary
 
