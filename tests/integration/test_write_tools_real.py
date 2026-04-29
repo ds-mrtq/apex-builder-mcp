@@ -1150,6 +1150,246 @@ def test_list_workspace_users_dev_live_2b6(dev_state):
 
 
 # ---------------------------------------------------------------------------
+# Read-tool sqlcl-fallback live DEV tests
+#
+# These verify all read tools that previously called _get_pool() directly
+# now route through tools/_read_helpers and execute under auth_mode=sqlcl.
+# ---------------------------------------------------------------------------
+
+
+def test_list_apps_dev_live_sqlcl(dev_state):
+    """Live DEV: list apps via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import apex_list_apps
+
+    result = apex_list_apps(
+        workspace=os.environ.get("APEX_TEST_WORKSPACE", "EREPORT")
+    )
+    assert "apps" in result
+    assert "count" in result
+    # Source app should be visible
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    app_ids = [a["application_id"] for a in result["apps"]]
+    assert src_app_id in app_ids
+
+
+def test_describe_app_dev_live_sqlcl(dev_state):
+    """Live DEV: describe source app via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import apex_describe_app
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    result = apex_describe_app(app_id=src_app_id)
+    assert result["found"] is True
+    assert result["application_id"] == src_app_id
+    assert result["application_name"]
+    assert isinstance(result["lov_count"], int)
+
+
+def test_describe_app_not_found_dev_live_sqlcl(dev_state):
+    """Live DEV: describe non-existent app returns found=False."""
+    from apex_builder_mcp.tools.inspect_apex import apex_describe_app
+
+    result = apex_describe_app(app_id=999999)
+    assert result["found"] is False
+
+
+def test_list_pages_dev_live_sqlcl(dev_state):
+    """Live DEV: list pages via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import apex_list_pages
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    result = apex_list_pages(app_id=src_app_id)
+    assert "pages" in result
+    assert result["count"] >= 1
+    # Page 0 (Global) should typically exist
+    page_ids = [p["page_id"] for p in result["pages"]]
+    assert 0 in page_ids or 1 in page_ids
+
+
+def test_describe_page_dev_live_sqlcl(dev_state):
+    """Live DEV: describe page 0 via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import apex_describe_page
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    # Try page 0 first; if absent fall back to first listed page.
+    result = apex_describe_page(app_id=src_app_id, page_id=0)
+    if not result.get("found"):
+        from apex_builder_mcp.tools.inspect_apex import apex_list_pages
+
+        pages = apex_list_pages(app_id=src_app_id)["pages"]
+        if not pages:
+            pytest.skip("source app has no pages")
+        result = apex_describe_page(
+            app_id=src_app_id, page_id=pages[0]["page_id"]
+        )
+    assert result["found"] is True
+    assert "regions" in result
+    assert "items" in result
+    assert "buttons" in result
+    assert "processes" in result
+
+
+def test_describe_acl_dev_live_sqlcl(dev_state):
+    """Live DEV: describe ACL of source app via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import apex_describe_acl
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    result = apex_describe_acl(app_id=src_app_id)
+    assert "assignments" in result
+    assert "count" in result
+
+
+def test_get_page_details_dev_live_sqlcl(dev_state):
+    """Live DEV: full page details via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import (
+        apex_get_page_details,
+        apex_list_pages,
+    )
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    pages = apex_list_pages(app_id=src_app_id)["pages"]
+    if not pages:
+        pytest.skip("source app has no pages")
+    page_id = pages[0]["page_id"]
+    result = apex_get_page_details(app_id=src_app_id, page_id=page_id)
+    assert result["found"] is True
+    assert "details" in result
+    assert "PAGE_NAME" in result["details"]
+
+
+def test_list_regions_dev_live_sqlcl(dev_state):
+    """Live DEV: list regions via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import (
+        apex_list_pages,
+        apex_list_regions,
+    )
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    pages = apex_list_pages(app_id=src_app_id)["pages"]
+    if not pages:
+        pytest.skip("source app has no pages")
+    # Find a page with at least 1 region by scanning a few pages
+    for p in pages[:10]:
+        result = apex_list_regions(app_id=src_app_id, page_id=p["page_id"])
+        if result["count"] > 0:
+            assert "regions" in result
+            assert isinstance(result["regions"], list)
+            return
+    # Even with 0 regions everywhere, the call should succeed
+    assert "regions" in result
+
+
+def test_list_items_dev_live_sqlcl(dev_state):
+    """Live DEV: list items via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import (
+        apex_list_items,
+        apex_list_pages,
+    )
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    pages = apex_list_pages(app_id=src_app_id)["pages"]
+    if not pages:
+        pytest.skip("source app has no pages")
+    for p in pages[:10]:
+        result = apex_list_items(app_id=src_app_id, page_id=p["page_id"])
+        if result["count"] > 0:
+            assert "items" in result
+            return
+    assert "items" in result
+
+
+def test_list_processes_dev_live_sqlcl(dev_state):
+    """Live DEV: list processes via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import (
+        apex_list_pages,
+        apex_list_processes,
+    )
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    pages = apex_list_pages(app_id=src_app_id)["pages"]
+    if not pages:
+        pytest.skip("source app has no pages")
+    for p in pages[:10]:
+        result = apex_list_processes(app_id=src_app_id, page_id=p["page_id"])
+        assert "processes" in result
+        if result["count"] > 0:
+            return
+
+
+def test_list_dynamic_actions_dev_live_sqlcl(dev_state):
+    """Live DEV: list dynamic actions via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_apex import (
+        apex_list_dynamic_actions,
+        apex_list_pages,
+    )
+
+    src_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    pages = apex_list_pages(app_id=src_app_id)["pages"]
+    if not pages:
+        pytest.skip("source app has no pages")
+    for p in pages[:10]:
+        result = apex_list_dynamic_actions(
+            app_id=src_app_id, page_id=p["page_id"]
+        )
+        assert "dynamic_actions" in result
+        if result["count"] > 0:
+            return
+
+
+def test_list_tables_dev_live_sqlcl(dev_state):
+    """Live DEV: list tables via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_db import apex_list_tables
+
+    result = apex_list_tables()
+    assert "tables" in result
+    assert "count" in result
+
+
+def test_describe_table_dev_live_sqlcl(dev_state):
+    """Live DEV: describe DUAL via SQLcl subprocess."""
+    from apex_builder_mcp.tools.inspect_db import apex_describe_table
+
+    result = apex_describe_table(table_name="DUAL", schema="SYS")
+    assert result["table_name"] == "DUAL"
+    assert "columns" in result
+    # DUAL has a single column DUMMY
+    if result["columns"]:
+        col_names = {c["name"] for c in result["columns"]}
+        assert "DUMMY" in col_names
+
+
+def test_get_source_dev_live_sqlcl(dev_state):
+    """Live DEV: get source of a known package via SQLcl subprocess.
+
+    Picks any package the connected user owns; skips if none exist.
+    """
+    from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+    from apex_builder_mcp.tools.inspect_db import apex_get_source
+
+    # Find a package the connected user owns
+    result = run_sqlcl(
+        os.environ["APEX_TEST_SQLCL_NAME"],
+        (
+            "set heading off feedback off pagesize 0 echo off\n"
+            "select min(name) from user_source where type = 'PACKAGE';\n"
+            "exit\n"
+        ),
+        timeout=30,
+    )
+    pkg_name: str | None = None
+    for line in result.cleaned.splitlines():
+        s = line.strip()
+        if s and s.replace("_", "").replace("$", "").replace("#", "").isalnum():
+            pkg_name = s
+            break
+    if not pkg_name:
+        pytest.skip("no packages owned by connected user")
+    src = apex_get_source(object_name=pkg_name, object_type="PACKAGE")
+    assert src["object_name"] == pkg_name.upper()
+    assert src["object_type"] == "PACKAGE"
+    assert src["line_count"] >= 1
+
+
+# ---------------------------------------------------------------------------
 # 2B-7 generator live DEV tests
 #
 # Probe ID range for 2B-7: 9200-9299. Generators compose existing low-level

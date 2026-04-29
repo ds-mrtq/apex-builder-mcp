@@ -1,4 +1,15 @@
-"""Read-only DB inspection tools (auto-loaded after apex_connect)."""
+"""Read-only DB inspection tools (auto-loaded after apex_connect).
+
+All tools except ``apex_run_sql`` branch on ``profile.auth_mode`` via the
+shared helpers in ``tools/_read_helpers.py``.
+
+``apex_run_sql`` still requires the oracledb pool — the SQLcl path is
+deferred due to arbitrary-SELECT parsing complexity (the user supplies
+the SELECT, so the pipe-separator marshalling trick used elsewhere does
+not apply). Under sqlcl-only mode it will raise NOT_CONNECTED via the
+pool path; callers should use ``apex_search_objects``, ``apex_describe_table``,
+``apex_get_source``, etc., for common cases.
+"""
 from __future__ import annotations
 
 import re
@@ -9,8 +20,12 @@ from apex_builder_mcp.connection.state import get_state
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
+from apex_builder_mcp.schema.profile import Profile
 from apex_builder_mcp.tools._read_helpers import (
     query_dependencies,
+    query_describe_table,
+    query_get_source,
+    query_list_tables,
     query_search_objects,
 )
 
@@ -30,6 +45,17 @@ def _get_pool() -> Any:
     return _get_or_create_pool()
 
 
+def _require_profile() -> Profile:
+    state = get_state()
+    if state.profile is None:
+        raise ApexBuilderError(
+            code="NOT_CONNECTED",
+            message="No active profile",
+            suggestion="Call apex_connect first",
+        )
+    return state.profile
+
+
 @apex_tool(name="apex_run_sql", category=Category.READ_DB)
 def apex_run_sql(sql: str, max_rows: int = 1000) -> dict[str, Any]:
     """Execute read-only SELECT/WITH (no DDL/DML, no semicolon chains, no db links).
@@ -37,6 +63,11 @@ def apex_run_sql(sql: str, max_rows: int = 1000) -> dict[str, Any]:
     Multi-layer guard: static syntax filter + max row cap. The least-privilege
     DB user (configured per scripts/grant_mcp_user.sql) provides additional
     Layer 1 defense - even if filter is bypassed, user has no DDL grants.
+
+    NOTE: this tool requires ``auth_mode=password`` (oracledb pool). Under
+    ``auth_mode=sqlcl``, the SQLcl path is deferred due to arbitrary-SELECT
+    parsing complexity. Use apex_search_objects / apex_describe_table /
+    apex_get_source for the common metadata queries instead.
     """
     is_safe_select(sql, raise_on_fail=True)
     if max_rows > MAX_ROWS:
@@ -55,28 +86,8 @@ def apex_list_tables(schema: str | None = None) -> dict[str, Any]:
     """List tables in current schema (or specified schema)."""
     if schema is not None:
         validate_object_name(schema, raise_on_fail=True)
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        if schema:
-            cur.execute(
-                "select table_name, num_rows, last_analyzed "
-                "from all_tables where owner = :owner order by table_name",
-                owner=schema.upper(),
-            )
-        else:
-            cur.execute(
-                "select table_name, num_rows, last_analyzed "
-                "from user_tables order by table_name"
-            )
-        rows = [
-            {
-                "table_name": r[0],
-                "num_rows": r[1],
-                "last_analyzed": str(r[2]) if r[2] else None,
-            }
-            for r in cur.fetchall()
-        ]
+    profile = _require_profile()
+    rows = query_list_tables(profile, schema)
     return {"tables": rows, "count": len(rows)}
 
 
@@ -86,40 +97,8 @@ def apex_describe_table(table_name: str, schema: str | None = None) -> dict[str,
     validate_object_name(table_name, raise_on_fail=True)
     if schema is not None:
         validate_object_name(schema, raise_on_fail=True)
-    pool = _get_pool()
-    owner = schema.upper() if schema else None
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        if owner:
-            cur.execute(
-                """
-                select column_name, data_type, data_length, nullable, data_default
-                  from all_tab_columns
-                 where owner = :owner and table_name = :tn
-                 order by column_id
-                """,
-                owner=owner, tn=table_name.upper(),
-            )
-        else:
-            cur.execute(
-                """
-                select column_name, data_type, data_length, nullable, data_default
-                  from user_tab_columns
-                 where table_name = :tn
-                 order by column_id
-                """,
-                tn=table_name.upper(),
-            )
-        cols = [
-            {
-                "name": r[0],
-                "type": r[1],
-                "length": r[2],
-                "nullable": r[3] == "Y",
-                "default": str(r[4]) if r[4] else None,
-            }
-            for r in cur.fetchall()
-        ]
+    profile = _require_profile()
+    cols = query_describe_table(profile, table_name, schema)
     return {"table_name": table_name.upper(), "columns": cols}
 
 
@@ -137,29 +116,8 @@ def apex_get_source(
         raise ValueError(
             f"object_type must be one of {sorted(ALLOWED_OBJECT_TYPES)}, got {object_type!r}"
         )
-    pool = _get_pool()
-    owner = schema.upper() if schema else None
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        if owner:
-            cur.execute(
-                """
-                select text from all_source
-                 where owner = :owner and name = :n and type = :t
-                 order by line
-                """,
-                owner=owner, n=object_name.upper(), t=object_type.upper(),
-            )
-        else:
-            cur.execute(
-                """
-                select text from user_source
-                 where name = :n and type = :t
-                 order by line
-                """,
-                n=object_name.upper(), t=object_type.upper(),
-            )
-        lines = [r[0] for r in cur.fetchall()]
+    profile = _require_profile()
+    lines = query_get_source(profile, object_name, object_type, schema)
     return {
         "object_name": object_name.upper(),
         "object_type": object_type.upper(),
@@ -208,15 +166,9 @@ def apex_search_objects(
                 )
             types_upper.append(up)
 
-    state = get_state()
-    if state.profile is None:
-        raise ApexBuilderError(
-            code="NOT_CONNECTED",
-            message="No active profile",
-            suggestion="Call apex_connect first",
-        )
+    profile = _require_profile()
     rows = query_search_objects(
-        state.profile, pattern, types_upper or None, MAX_ROWS
+        profile, pattern, types_upper or None, MAX_ROWS
     )
     return {
         "pattern": pattern,
@@ -253,15 +205,9 @@ def apex_dependencies(
                 "FUNCTION, PROCEDURE, VIEW, TYPE, TYPE BODY, TRIGGER."
             ),
         )
-    state = get_state()
-    if state.profile is None:
-        raise ApexBuilderError(
-            code="NOT_CONNECTED",
-            message="No active profile",
-            suggestion="Call apex_connect first",
-        )
+    profile = _require_profile()
     uses, used_by = query_dependencies(
-        state.profile, obj_upper, type_upper, MAX_ROWS
+        profile, obj_upper, type_upper, MAX_ROWS
     )
     return {
         "object_name": obj_upper,
