@@ -14,6 +14,7 @@ from apex_builder_mcp.connection.state import get_state
 from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import apex_tool
 from apex_builder_mcp.schema.errors import ApexBuilderError
+from apex_builder_mcp.tools.lazy import _get_loader as _get_lazy_loader
 
 PROFILES_YAML: Path = Path.home() / ".apex-builder-mcp" / "profiles.yaml"
 
@@ -112,12 +113,17 @@ def apex_connect(profile_name: str) -> dict[str, Any]:
     state.set_profile(profile)
     state.mark_connected()
 
+    # Auto-load read categories after successful connect
+    loader = _get_lazy_loader()
+    loader.on_post_connect()
+
     return {
         "state": state.status,
         "profile": profile_name,
         "environment": profile.environment,
         "workspace": profile.workspace,
         "user": md.user,
+        "loaded_categories": sorted(c.value for c in loader.loaded_categories()),
     }
 
 

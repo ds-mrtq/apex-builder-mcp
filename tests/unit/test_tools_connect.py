@@ -66,3 +66,34 @@ def test_disconnect_after_connect(monkeypatch, tmp_profiles_yaml):
     apex_connect(profile_name="DEV1")
     result = apex_disconnect()
     assert result["state"] == "DISCONNECTED"
+
+
+def test_connect_auto_loads_read_categories(monkeypatch, tmp_profiles_yaml):
+    """After successful connect, READ_DB + READ_APEX categories should be loaded."""
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.PROFILES_YAML", tmp_profiles_yaml
+    )
+    fake_md = MagicMock()
+    fake_md.dsn = "x"
+    fake_md.user = "u"
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.read_connection_metadata", lambda n: fake_md
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.get_password", lambda *a, **kw: "p"
+    )
+    fake_pool = MagicMock()
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.ApexBuilderPool", lambda: fake_pool
+    )
+
+    from apex_builder_mcp.registry.categories import Category
+    from apex_builder_mcp.tools.lazy import _get_loader, _reset_loader_for_tests
+    _reset_loader_for_tests()
+
+    apex_connect(profile_name="DEV1")
+
+    loader = _get_loader()
+    loaded = loader.loaded_categories()
+    assert Category.READ_DB in loaded
+    assert Category.READ_APEX in loaded
