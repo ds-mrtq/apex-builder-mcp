@@ -312,3 +312,61 @@ def apex_list_items(app_id: int, page_id: int) -> dict[str, Any]:
             for r in cur.fetchall()
         ]
     return {"app_id": app_id, "page_id": page_id, "items": rows, "count": len(rows)}
+
+
+@apex_tool(name="apex_list_processes", category=Category.READ_APEX)
+def apex_list_processes(app_id: int, page_id: int) -> dict[str, Any]:
+    """List page processes with type, point, sequence, and PL/SQL body."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select process_id, process_name, process_type, process_sequence, "
+            "process_point, process_sql_clob "
+            "from apex_application_page_proc "
+            "where application_id = :a and page_id = :p order by process_sequence",
+            a=app_id, p=page_id,
+        )
+        rows = [
+            {
+                "process_id": r[0],
+                "name": r[1],
+                "type": r[2],
+                "sequence": r[3],
+                "point": r[4],
+                "code": str(r[5]) if r[5] else None,
+            }
+            for r in cur.fetchall()
+        ]
+    return {"app_id": app_id, "page_id": page_id, "processes": rows, "count": len(rows)}
+
+
+@apex_tool(name="apex_list_dynamic_actions", category=Category.READ_APEX)
+def apex_list_dynamic_actions(app_id: int, page_id: int) -> dict[str, Any]:
+    """List dynamic action events on a page (event name, when-element, type)."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select dynamic_action_id, dynamic_action_name, when_event_name, "
+            "when_element_type, when_element "
+            "from apex_application_page_da "
+            "where application_id = :a and page_id = :p order by event_sequence",
+            a=app_id, p=page_id,
+        )
+        events = [
+            {
+                "da_id": r[0],
+                "name": r[1],
+                "event": r[2],
+                "element_type": r[3],
+                "element": r[4],
+            }
+            for r in cur.fetchall()
+        ]
+    return {
+        "app_id": app_id,
+        "page_id": page_id,
+        "dynamic_actions": events,
+        "count": len(events),
+    }

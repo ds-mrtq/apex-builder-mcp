@@ -9,8 +9,10 @@ from apex_builder_mcp.tools.inspect_apex import (
     apex_describe_page_human,
     apex_get_page_details,
     apex_list_apps,
+    apex_list_dynamic_actions,
     apex_list_items,
     apex_list_pages,
+    apex_list_processes,
     apex_list_regions,
 )
 
@@ -214,3 +216,41 @@ def test_list_items(monkeypatch):
     result = apex_list_items(app_id=100, page_id=1)
     assert result["count"] == 1
     assert result["items"][0]["name"] == "P1_X"
+
+
+def test_list_processes(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        (4000, "PROC_OK", "NATIVE_PLSQL", 10, "AFTER_SUBMIT", "begin null; end;"),
+        (4001, "PROC_LOG", "NATIVE_PLSQL", 20, "BEFORE_HEADER", None),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_processes(app_id=100, page_id=1)
+    assert result["count"] == 2
+    assert result["processes"][0]["name"] == "PROC_OK"
+    assert result["processes"][0]["code"] == "begin null; end;"
+    assert result["processes"][1]["code"] is None
+
+
+def test_list_dynamic_actions(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        (5000, "DA_X", "click", "JQUERY_SELECTOR", "#P1_BUTTON"),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_dynamic_actions(app_id=100, page_id=1)
+    assert result["count"] == 1
+    assert result["dynamic_actions"][0]["name"] == "DA_X"
+    assert result["dynamic_actions"][0]["event"] == "click"

@@ -417,3 +417,148 @@ def test_bulk_add_items_dev_live(dev_state):
         assert result["after"]["items"] == result["before"]["items"] + 3
     finally:
         _cleanup_probe_lifecycle(app_id)
+
+
+# ---------------------------------------------------------------------------
+# 2B-2 buttons / processes / dynamic-actions live DEV tests
+#
+# Probe ID range for 2B-2: 8600-8699 (avoids collision with 2B-1's 8500-8599).
+# ---------------------------------------------------------------------------
+
+PROBE_2B2_PAGE = 8600
+PROBE_2B2_REGION = 8601
+PROBE_2B2_BUTTON = 8602
+PROBE_2B2_PROCESS = 8603
+PROBE_2B2_DA_EVENT = 8604
+PROBE_2B2_DA_ACTION = 8605
+
+
+def _add_probe_page_2b2_via_sqlcl(app_id: int) -> None:
+    """Use ImportSession directly to add a probe page for 2B-2 tests."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  wwv_flow_imp_page.create_page("
+        f"p_id => {PROBE_2B2_PAGE}, "
+        f"p_name => 'ITEST_PROBE_2B2', "
+        f"p_alias => 'ITEST_PROBE_2B2', "
+        f"p_step_title => 'ITEST_PROBE_2B2', "
+        f"p_autocomplete_on_off => 'OFF', "
+        f"p_page_template_options => '#DEFAULT#'"
+        f");\n"
+    )
+    sess.execute(body)
+
+
+def _cleanup_probe_2b2(app_id: int) -> None:
+    """Best-effort cleanup of 2B-2 probe page (cascades to children)."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  begin wwv_flow_imp_page.remove_page("
+        f"p_flow_id => {app_id}, p_page_id => {PROBE_2B2_PAGE}"
+        f"); exception when others then null; end;\n"
+    )
+    try:
+        sess.execute(body)
+    except Exception:
+        pass  # best-effort
+
+
+def test_add_button_dev_live(dev_state):
+    """Live DEV: add probe page+region, then apex_add_button + verify by id."""
+    from apex_builder_mcp.tools.buttons import apex_add_button
+    from apex_builder_mcp.tools.regions import apex_add_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_2b2_via_sqlcl(app_id)
+        apex_add_region(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            region_id=PROBE_2B2_REGION,
+            name="ITEST_2B2_REGION",
+        )
+        result = apex_add_button(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            button_id=PROBE_2B2_BUTTON,
+            region_id=PROBE_2B2_REGION,
+            name="ITEST_2B2_BTN",
+            action="SUBMIT",
+        )
+        assert result["dry_run"] is False
+        assert result["button_id"] == PROBE_2B2_BUTTON
+    finally:
+        _cleanup_probe_2b2(app_id)
+
+
+def test_add_process_dev_live(dev_state):
+    """Live DEV: add probe page, then apex_add_process + verify by id."""
+    from apex_builder_mcp.tools.processes import apex_add_process
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_2b2_via_sqlcl(app_id)
+        result = apex_add_process(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            process_id=PROBE_2B2_PROCESS,
+            name="ITEST_2B2_PROC",
+            plsql_code="null;",
+        )
+        assert result["dry_run"] is False
+        assert result["process_id"] == PROBE_2B2_PROCESS
+    finally:
+        _cleanup_probe_2b2(app_id)
+
+
+def test_add_dynamic_action_dev_live(dev_state):
+    """Live DEV: add probe page+region+button, then apex_add_dynamic_action."""
+    from apex_builder_mcp.tools.buttons import apex_add_button
+    from apex_builder_mcp.tools.dynamic_actions import apex_add_dynamic_action
+    from apex_builder_mcp.tools.regions import apex_add_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_2b2_via_sqlcl(app_id)
+        apex_add_region(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            region_id=PROBE_2B2_REGION,
+            name="ITEST_2B2_REGION",
+        )
+        apex_add_button(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            button_id=PROBE_2B2_BUTTON,
+            region_id=PROBE_2B2_REGION,
+            name="ITEST_2B2_BTN",
+            action="DEFINED_BY_DA",
+        )
+        result = apex_add_dynamic_action(
+            app_id=app_id,
+            page_id=PROBE_2B2_PAGE,
+            da_event_id=PROBE_2B2_DA_EVENT,
+            da_action_id=PROBE_2B2_DA_ACTION,
+            name="ITEST_2B2_DA",
+            triggering_element=f"#B{PROBE_2B2_BUTTON}",
+            event_type="click",
+            action_type="NATIVE_ALERT",
+            action_attribute_01="hello from 2B-2",
+        )
+        assert result["dry_run"] is False
+        assert result["da_event_id"] == PROBE_2B2_DA_EVENT
+        assert result["da_action_id"] == PROBE_2B2_DA_ACTION
+    finally:
+        _cleanup_probe_2b2(app_id)
