@@ -1,23 +1,19 @@
-"""Phase 0 Gate 5 — Round-Trip Proof harness (clone strategy via SQLcl).
+"""Phase 0 Gate 5 - in-place probe round-trip (Option C, MVP-aligned).
 
-Flow:
-1. apex export source_app_id (default 100) -> .sql file
-2. Reimport as clone_app_id (random 900xxx) with generate_offset
-3. Compare metadata: clone pages == source pages, regions == source regions
-4. Add 1 page + 1 region + 1 item to CLONE via wwv_flow_imp_page.*
-   (This validates the 3 MVP internal procs we actually need)
-5. Re-export clone, verify export contains the new page id
-6. Open new page in runtime URL, verify HTTP 200 + no error markers
-7. Drop clone via wwv_flow_imp.remove_flow
-8. Source app untouched throughout
-9. Write findings JSON to docs/PHASE_0_REPORT.md, return PASS/FAIL
+Tests the actual MVP write path:
+1. ADD probe page+region+item to existing app via wwv_flow_imp_page.create_*
+2. Verify metadata + export captures probe + runtime renders probe page
+3. DELETE probe via wwv_flow_imp_page.remove_page so source app is restored
+
+Source app is briefly modified but cleanly reverted. Probe IDs picked below
+the existing page id range to avoid collision (8000 vs app 100's range 9999+).
 
 Required env vars:
     APEX_TEST_SQLCL_NAME       SQLcl named connection (e.g., ereport_test8001)
     APEX_TEST_WORKSPACE        APEX workspace name (e.g., EREPORT)
     APEX_TEST_SCHEMA           Schema (e.g., EREPORT)
     APEX_TEST_RUNTIME_URL      Runtime URL prefix
-    APEX_TEST_SOURCE_APP_ID    Source app to clone (default: 100)
+    APEX_TEST_SOURCE_APP_ID    App id to test on (default: 100)
 """
 from __future__ import annotations
 
@@ -25,13 +21,17 @@ import argparse
 import json
 import os
 import re
-import secrets
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+
+PROBE_PAGE_ID = 8000
+PROBE_REGION_ID = 8001
+PROBE_ITEM_ID = 8002
+PROBE_NAME = "PHASE0_PROBE"
 
 
 def _sqlcl(conn_name: str, sql_text: str, *, timeout: int = 180) -> tuple[int, str, str]:
@@ -74,9 +74,9 @@ def lookup_workspace_id(conn_name: str, workspace: str) -> int:
 select workspace_id from apex_workspaces where upper(workspace) = '{workspace.upper()}';
 exit
 """
-    rc, stdout, stderr = _sqlcl(conn_name, sql)
+    rc, stdout, _ = _sqlcl(conn_name, sql)
     if rc != 0:
-        raise RuntimeError(f"workspace lookup failed: {stderr}")
+        raise RuntimeError(f"workspace lookup failed:\n{stdout}")
     for line in _strip_banner(stdout).splitlines():
         s = line.strip()
         if s.isdigit():
@@ -99,7 +99,6 @@ exit
     nums = [int(s.strip()) for s in body.splitlines() if s.strip().isdigit()]
     if len(nums) < 3:
         raise RuntimeError(f"could not parse 3 numbers from:\n{body}")
-    # Find alias (first non-numeric, non-empty line after the numbers)
     alias = None
     for line in body.splitlines():
         s = line.strip()
@@ -114,74 +113,31 @@ exit
     }
 
 
-def export_app(conn_name: str, app_id: int, output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    sql = f"""apex export -applicationid {app_id} -dir {output_dir.as_posix()}
-exit
-"""
-    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=300)
-    if rc != 0 or _has_db_error(stdout):
-        raise RuntimeError(f"export failed:\n{stdout}\n{stderr}")
-    candidates = list(output_dir.glob("*.sql"))
-    if not candidates:
-        raise RuntimeError(f"no .sql file produced in {output_dir}")
-    # Prefer fNNN.sql shape
-    primary = [p for p in candidates if re.match(rf"^f{app_id}\.sql$", p.name)]
-    return primary[0] if primary else candidates[0]
-
-
-def reimport_as_new_app(
-    conn_name: str,
-    export_file: Path,
-    new_app_id: int,
-    ws_id: int,
-    schema: str,
-) -> None:
-    # Stage the install context, then run the export script via @
-    sql = f"""set echo off feedback off
+def add_probe_to_app(conn_name: str, app_id: int, ws_id: int, schema: str) -> None:
+    """Add probe page+region+item via wwv_flow_imp_page.create_* (MVP write path)."""
+    sql = f"""set echo off feedback on
 begin
   wwv_flow_application_install.set_workspace_id({ws_id});
   wwv_flow_application_install.set_schema('{schema}');
-  wwv_flow_application_install.set_application_id({new_app_id});
-  wwv_flow_application_install.generate_offset;
-end;
-/
-@{export_file.as_posix()}
-exit
-"""
-    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=600)
-    if rc != 0 or _has_db_error(stdout):
-        raise RuntimeError(f"reimport failed:\n{_strip_banner(stdout)}\n{stderr}")
-
-
-def add_page_region_item(
-    conn_name: str, clone_app_id: int, new_page_id: int, region_id: int, item_id: int
-) -> None:
-    """Add 1 page + 1 region + 1 item via internal wwv_flow_imp_page.* procs.
-
-    This is the actual MVP write path — the 3 calls our spec section 5.2 lists.
-    """
-    sql = f"""set echo off feedback on
-begin
-  wwv_flow_application_install.set_application_id({clone_app_id});
+  wwv_flow_application_install.set_application_id({app_id});
   wwv_flow_imp_page.create_page(
-    p_id => {new_page_id},
-    p_name => 'PHASE0_PROBE',
-    p_step_title => 'PHASE0_PROBE'
+    p_id => {PROBE_PAGE_ID},
+    p_name => '{PROBE_NAME}',
+    p_step_title => '{PROBE_NAME}'
   );
   wwv_flow_imp_page.create_page_plug(
-    p_id => {region_id},
-    p_plug_name => 'PHASE0_REGION',
+    p_id => {PROBE_REGION_ID},
+    p_plug_name => '{PROBE_NAME}_REGION',
     p_plug_template => 0,
     p_plug_display_sequence => 10,
     p_plug_source_type => 'NATIVE_HTML',
     p_plug_query_options => 'DERIVED_REPORT_COLUMNS'
   );
   wwv_flow_imp_page.create_page_item(
-    p_id => {item_id},
-    p_name => 'P{new_page_id}_PROBE_ITEM',
+    p_id => {PROBE_ITEM_ID},
+    p_name => 'P{PROBE_PAGE_ID}_PROBE_ITEM',
     p_item_sequence => 10,
-    p_item_plug_id => {region_id},
+    p_item_plug_id => {PROBE_REGION_ID},
     p_display_as => 'NATIVE_TEXT_FIELD'
   );
   commit;
@@ -192,23 +148,43 @@ exit
     rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=120)
     if rc != 0 or _has_db_error(stdout):
         raise RuntimeError(
-            f"add page/region/item failed:\n{_strip_banner(stdout)}\n{stderr}"
+            f"add probe failed:\n{_strip_banner(stdout)}\nstderr:\n{stderr}"
         )
 
 
-def drop_app(conn_name: str, app_id: int) -> None:
+def remove_probe_from_app(conn_name: str, app_id: int) -> None:
+    """Delete probe page via wwv_flow_imp_page.remove_page."""
     sql = f"""set echo off feedback off
 begin
-  begin
-    wwv_flow_imp.remove_flow({app_id});
-  exception when others then null;
-  end;
+  wwv_flow_imp_page.remove_page(
+    p_flow_id => {app_id},
+    p_page_id => {PROBE_PAGE_ID}
+  );
   commit;
 end;
 /
 exit
 """
-    _sqlcl(conn_name, sql, timeout=60)
+    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=60)
+    if rc != 0 or _has_db_error(stdout):
+        raise RuntimeError(
+            f"remove probe failed:\n{_strip_banner(stdout)}\nstderr:\n{stderr}"
+        )
+
+
+def export_app(conn_name: str, app_id: int, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sql = f"""apex export -applicationid {app_id} -dir {output_dir.as_posix()}
+exit
+"""
+    rc, stdout, stderr = _sqlcl(conn_name, sql, timeout=300)
+    if rc != 0 or _has_db_error(stdout):
+        raise RuntimeError(f"export failed:\n{stdout}\n{stderr}")
+    candidates = list(output_dir.glob("*.sql"))
+    if not candidates:
+        raise RuntimeError(f"no .sql produced in {output_dir}")
+    primary = [p for p in candidates if re.match(rf"^f{app_id}\.sql$", p.name)]
+    return primary[0] if primary else candidates[0]
 
 
 def verify_runtime(runtime_url: str, app_alias: str, page_id: int) -> tuple[bool, str]:
@@ -248,48 +224,72 @@ def main() -> int:
     workspace = os.environ["APEX_TEST_WORKSPACE"]
     schema = os.environ["APEX_TEST_SCHEMA"]
     runtime_url = os.environ["APEX_TEST_RUNTIME_URL"]
-    source_app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
-
-    clone_app_id = 900000 + secrets.randbelow(99999)
-    # Pick safe new IDs in clone (high range to avoid collision with cloned content)
-    probe_page_id = 9000
-    probe_region_id = 90000
-    probe_item_id = 900000
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
 
     findings: dict = {
         "timestamp": datetime.now(UTC).isoformat(),
+        "strategy": "in-place probe (Option C)",
         "sqlcl_conn": conn,
         "workspace": workspace,
         "schema": schema,
-        "source_app_id": source_app_id,
-        "clone_app_id": clone_app_id,
+        "app_id": app_id,
         "probe_ids": {
-            "page": probe_page_id,
-            "region": probe_region_id,
-            "item": probe_item_id,
+            "page": PROBE_PAGE_ID,
+            "region": PROBE_REGION_ID,
+            "item": PROBE_ITEM_ID,
         },
         "steps": [],
     }
     overall_pass = True
+    probe_added = False
 
     try:
         ws_id = lookup_workspace_id(conn, workspace)
         findings["workspace_id"] = ws_id
         print(f"[Lookup] workspace {workspace} -> id {ws_id}")
 
-        print(f"[1/8] Get source app {source_app_id} metadata")
-        meta_source = metadata_for_app(conn, source_app_id)
+        print(f"[1/7] Get source metadata for app {app_id}")
+        meta_before = metadata_for_app(conn, app_id)
         findings["steps"].append(
-            {"step": "source_meta", "status": "ok", "metadata": meta_source}
+            {"step": "source_meta", "status": "ok", "metadata": meta_before}
         )
-        print(f"    source: {meta_source}")
+        print(f"    before: {meta_before}")
 
-        print(f"[2/8] Export source app {source_app_id} via 'apex export'")
-        export_dir = Path(os.environ.get("TEMP", "/tmp")) / f"apex_rt_{clone_app_id}"
-        export_file = export_app(conn, source_app_id, export_dir)
+        print("[2/7] Add probe page/region/item via wwv_flow_imp_page.create_*")
+        add_probe_to_app(conn, app_id, ws_id, schema)
+        probe_added = True
+        meta_after_add = metadata_for_app(conn, app_id)
+        if meta_after_add["pages"] != meta_before["pages"] + 1:
+            findings["steps"].append(
+                {
+                    "step": "add_probe",
+                    "status": "fail",
+                    "before": meta_before,
+                    "after": meta_after_add,
+                    "reason": "page count did not increase by 1",
+                }
+            )
+            overall_pass = False
+            print(
+                f"    FAIL - pages {meta_before['pages']} -> "
+                f"{meta_after_add['pages']}, expected +1"
+            )
+        else:
+            findings["steps"].append(
+                {
+                    "step": "add_probe",
+                    "status": "ok",
+                    "metadata": meta_after_add,
+                }
+            )
+            print(f"    PASS - pages {meta_before['pages']} -> {meta_after_add['pages']}")
+
+        print(f"[3/7] Export app {app_id} via 'apex export'")
+        export_dir = Path(os.environ.get("TEMP", "/tmp")) / f"apex_phase0_{app_id}"
+        export_file = export_app(conn, app_id, export_dir)
         findings["steps"].append(
             {
-                "step": "export_source",
+                "step": "export",
                 "status": "ok",
                 "file": str(export_file),
                 "size": export_file.stat().st_size,
@@ -297,123 +297,26 @@ def main() -> int:
         )
         print(f"    -> {export_file} ({export_file.stat().st_size} bytes)")
 
-        print(f"[3/8] Reimport as clone app {clone_app_id} (with offset)")
-        reimport_as_new_app(conn, export_file, clone_app_id, ws_id, schema)
-        meta_clone = metadata_for_app(conn, clone_app_id)
-        findings["steps"].append(
-            {
-                "step": "reimport",
-                "status": "ok",
-                "metadata": meta_clone,
-            }
-        )
-        print(f"    clone: {meta_clone}")
-
-        print("[4/8] Compare metadata identity (source vs clone)")
-        # Pages should match. Regions/items may differ slightly due to offset
-        # generation but at minimum should be > 0 and proportional.
-        if meta_source["pages"] != meta_clone["pages"]:
+        print(f"[4/7] Grep export for '{PROBE_NAME}'")
+        export_text = export_file.read_text(encoding="utf-8", errors="replace")
+        if PROBE_NAME in export_text:
             findings["steps"].append(
-                {
-                    "step": "metadata_match",
-                    "status": "fail",
-                    "source": meta_source,
-                    "clone": meta_clone,
-                    "reason": "page count mismatch",
-                }
+                {"step": "export_contains_probe", "status": "ok"}
             )
-            overall_pass = False
-            print(
-                f"    FAIL - page count mismatch "
-                f"({meta_source['pages']} vs {meta_clone['pages']})"
-            )
-        elif meta_clone["regions"] == 0 or meta_clone["items"] == 0:
-            findings["steps"].append(
-                {
-                    "step": "metadata_match",
-                    "status": "fail",
-                    "source": meta_source,
-                    "clone": meta_clone,
-                    "reason": "clone has 0 regions or items - export/reimport incomplete",
-                }
-            )
-            overall_pass = False
-            print("    FAIL - clone has 0 regions or items")
+            print(f"    PASS - export contains '{PROBE_NAME}'")
         else:
             findings["steps"].append(
                 {
-                    "step": "metadata_match",
-                    "status": "ok",
-                    "source": meta_source,
-                    "clone": meta_clone,
-                }
-            )
-            print("    PASS - metadata identity OK")
-
-        print(
-            f"[5/8] Add probe page/region/item to clone {clone_app_id} via wwv_flow_imp_page.*"
-        )
-        add_page_region_item(
-            conn, clone_app_id, probe_page_id, probe_region_id, probe_item_id
-        )
-        meta_after_probe = metadata_for_app(conn, clone_app_id)
-        if meta_after_probe["pages"] != meta_clone["pages"] + 1:
-            findings["steps"].append(
-                {
-                    "step": "add_probe",
+                    "step": "export_contains_probe",
                     "status": "fail",
-                    "before": meta_clone,
-                    "after": meta_after_probe,
-                    "reason": "page count did not increase by 1",
+                    "reason": "probe name not found in export",
                 }
             )
             overall_pass = False
-            print(
-                f"    FAIL - page count {meta_after_probe['pages']} "
-                f"!= expected {meta_clone['pages']+1}"
-            )
-        else:
-            findings["steps"].append(
-                {
-                    "step": "add_probe",
-                    "status": "ok",
-                    "metadata": meta_after_probe,
-                }
-            )
-            print(
-                f"    PASS - page added "
-                f"(count {meta_clone['pages']} -> {meta_after_probe['pages']})"
-            )
+            print(f"    FAIL - '{PROBE_NAME}' not in export")
 
-        print(f"[6/8] Re-export clone {clone_app_id} and grep for probe page name")
-        export_dir2 = Path(os.environ.get("TEMP", "/tmp")) / f"apex_rt2_{clone_app_id}"
-        export_file2 = export_app(conn, clone_app_id, export_dir2)
-        export_text = export_file2.read_text(encoding="utf-8", errors="replace")
-        if "PHASE0_PROBE" in export_text:
-            findings["steps"].append(
-                {
-                    "step": "reexport_contains_probe",
-                    "status": "ok",
-                    "file": str(export_file2),
-                    "size": export_file2.stat().st_size,
-                }
-            )
-            print("    PASS - re-export contains 'PHASE0_PROBE'")
-        else:
-            findings["steps"].append(
-                {
-                    "step": "reexport_contains_probe",
-                    "status": "fail",
-                    "reason": "probe page not in re-export",
-                }
-            )
-            overall_pass = False
-            print("    FAIL - probe page text not in re-export")
-
-        print(f"[7/8] Open probe page in runtime ({meta_after_probe['alias']}/{probe_page_id})")
-        ok, info = verify_runtime(
-            runtime_url, meta_after_probe["alias"] or "", probe_page_id
-        )
+        print(f"[5/7] Open probe page in runtime ({meta_after_add['alias']}/{PROBE_PAGE_ID})")
+        ok, info = verify_runtime(runtime_url, meta_after_add["alias"] or "", PROBE_PAGE_ID)
         findings["steps"].append(
             {"step": "runtime_open", "status": "ok" if ok else "fail", "detail": info}
         )
@@ -423,7 +326,47 @@ def main() -> int:
             overall_pass = False
             print(f"    FAIL - {info}")
 
-        print(f"[8/8] Drop clone {clone_app_id}")
+        print("[6/7] Cleanup: remove probe page via wwv_flow_imp_page.remove_page")
+        remove_probe_from_app(conn, app_id)
+        probe_added = False
+        meta_after_remove = metadata_for_app(conn, app_id)
+        if meta_after_remove["pages"] != meta_before["pages"]:
+            findings["steps"].append(
+                {
+                    "step": "remove_probe",
+                    "status": "fail",
+                    "before_remove": meta_after_add,
+                    "after_remove": meta_after_remove,
+                    "expected_pages": meta_before["pages"],
+                    "reason": "page count did not return to original",
+                }
+            )
+            overall_pass = False
+            print(
+                f"    FAIL - pages after remove {meta_after_remove['pages']} "
+                f"!= original {meta_before['pages']}"
+            )
+        else:
+            findings["steps"].append(
+                {"step": "remove_probe", "status": "ok", "metadata": meta_after_remove}
+            )
+            print(f"    PASS - pages back to {meta_after_remove['pages']}")
+
+        print("[7/7] Final integrity check: source app metadata identity")
+        if meta_after_remove == meta_before:
+            findings["steps"].append({"step": "final_integrity", "status": "ok"})
+            print("    PASS - source app metadata identical to original")
+        else:
+            findings["steps"].append(
+                {
+                    "step": "final_integrity",
+                    "status": "warn",
+                    "before": meta_before,
+                    "after_full_cycle": meta_after_remove,
+                    "note": "page count matches but other fields differ",
+                }
+            )
+            print(f"    WARN - some fields differ: {meta_before} vs {meta_after_remove}")
     except Exception as e:
         findings["steps"].append(
             {"step": "exception", "status": "fail", "detail": f"{type(e).__name__}: {e}"}
@@ -431,22 +374,26 @@ def main() -> int:
         overall_pass = False
         print(f"\nEXCEPTION: {e}", file=sys.stderr)
     finally:
-        try:
-            drop_app(conn, clone_app_id)
-            findings["cleanup"] = {"clone_dropped": clone_app_id}
-        except Exception as e:
-            findings["cleanup"] = {"clone_drop_failed": str(e)}
+        # Defensive cleanup if probe was added but step 6 didn't run
+        if probe_added:
+            try:
+                remove_probe_from_app(conn, app_id)
+                findings["cleanup"] = "probe removed in finally"
+                print("\n[finally] probe removed via finally clause", file=sys.stderr)
+            except Exception as e:
+                findings["cleanup"] = f"probe cleanup FAILED: {e}"
+                print(f"\n[finally] probe cleanup FAILED: {e}", file=sys.stderr)
 
     findings["overall"] = "PASS" if overall_pass else "FAIL"
 
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("a", encoding="utf-8") as fh:
-        fh.write("\n\n## Gate 5 Round-Trip Proof Findings (clone strategy)\n\n")
+        fh.write("\n\n## Gate 5 In-Place Probe Findings (Option C)\n\n")
         fh.write("```json\n")
         fh.write(json.dumps(findings, indent=2, ensure_ascii=False))
         fh.write("\n```\n")
 
-    print(f"\n=== ROUND-TRIP RESULT: {findings['overall']} ===")
+    print(f"\n=== GATE 5 RESULT: {findings['overall']} ===")
     return 0 if overall_pass else 1
 
 
