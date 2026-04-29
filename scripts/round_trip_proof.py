@@ -227,45 +227,67 @@ exit
     return primary[0] if primary else candidates[0]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Don't follow redirects — we want to inspect the FIRST response."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None  # signal "do not follow"
+
+
 def verify_runtime(runtime_url: str, app_alias: str, page_id: int) -> tuple[bool, str]:
     """Verify probe page is registered with ORDS.
 
     nginx in front of ORDS rejects requests without browser User-Agent (returns 410),
-    so we send Edge UA. ORDS then redirects unauthenticated requests to /login page
-    (HTTP 302 -> 200 on login page) which proves the page exists. We accept any
-    non-error response that resolves to HTTP 200 after redirects, and reject only
-    on app/page not found markers.
+    so we send Edge UA. ORDS then returns 302 to a login/sign-in page for protected
+    pages — that 302 proves the page is registered with ORDS. We do NOT follow the
+    redirect (auth flow needs cookie jar / session). We accept:
+      - HTTP 200 with no fatal error markers (page accessible without auth)
+      - HTTP 302 with Location pointing at login/sign-in (page registered, auth wall)
     """
     url = f"{runtime_url.rstrip('/')}/{app_alias.lower()}/{page_id}"
     ua = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
     )
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     req = urllib.request.Request(url, headers={"User-Agent": ua})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
-            final_url = resp.geturl()
+        resp = opener.open(req, timeout=30)  # noqa: S310
+        # urllib returns the response directly when redirect handler returns None
+        # but newer urllib raises HTTPError instead. Handle both.
+        try:
             html = resp.read().decode("utf-8", errors="replace")
-            if resp.status != 200:
-                return (False, f"{url} -> HTTP {resp.status}")
-            # If we got redirected to a /login or /sign-in page, that proves the
-            # source page exists and ORDS is routing it (just behind auth).
-            if "/login" in final_url.lower() or "/sign-in" in final_url.lower():
-                return (True, f"{url} -> 302->{final_url} (login redirect = page registered)")
-            # Direct 200 — verify no fatal error markers
-            for marker in [
-                "application not found",
-                "page not found",
-                "ORA-",
-                "<title>Error",
-            ]:
-                if marker in html:
-                    return (False, f"{url} -> 200 but contains '{marker}'")
-            return (True, f"{url} -> HTTP 200, final={final_url}")
+            status = resp.status
+            location = resp.headers.get("Location", "")
+        finally:
+            resp.close()
     except urllib.error.HTTPError as e:
-        return (False, f"{url} -> HTTPError {e.code}: {e.reason}")
+        # 3xx codes raised here when redirect handler refuses to follow
+        status = e.code
+        location = e.headers.get("Location", "") if e.headers else ""
+        try:
+            html = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            html = ""
     except Exception as e:
         return (False, f"{url} -> {type(e).__name__}: {e}")
+
+    if status in (301, 302, 303, 307, 308):
+        loc_lower = location.lower()
+        if "/login" in loc_lower or "/sign-in" in loc_lower or "session=" in loc_lower:
+            return (True, f"{url} -> {status} -> {location} (auth redirect = page registered)")
+        return (True, f"{url} -> {status} -> {location}")
+    if status == 200:
+        for marker in [
+            "application not found",
+            "page not found",
+            "ORA-",
+            "<title>Error",
+        ]:
+            if marker in html:
+                return (False, f"{url} -> 200 but contains '{marker}'")
+        return (True, f"{url} -> HTTP 200, no error markers")
+    return (False, f"{url} -> HTTP {status}")
 
 
 def main() -> int:
