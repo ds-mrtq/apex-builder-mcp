@@ -16,6 +16,7 @@ round_trip_proof.py pattern.
 from __future__ import annotations
 
 import os
+import secrets
 
 import pytest
 
@@ -833,29 +834,39 @@ def test_add_calendar_dev_live(dev_state):
 #
 # Probe ID range for 2B-5: 8900-8999. Shared components are app-scoped
 # (no probe page needed for LOV/auth/app_item; nav_item needs an existing
-# list_id). Cleanup uses wwv_flow_imp_shared.remove_* where available, else
-# wraps best-effort PL/SQL block.
+# list_id).
+#
+# Test isolation strategy: APEX 24.2 exposes no public REMOVE_LOV /
+# REMOVE_AUTHENTICATION / REMOVE_FLOW_ITEM / REMOVE_LIST_ITEM procs, and the
+# underlying apex_240200.wwv_flow_* tables are not delete-able from the
+# workspace schema. Once a leftover record is in place, recreating with the
+# same (flow_id, name) violates WWV_FLOW_ITEMS_IDX3 / similar unique indexes.
+# Therefore each test run randomizes BOTH the id (in 8900..8998) AND the
+# name (suffix = secrets.token_hex(3)). Collisions across runs become
+# astronomically unlikely. Live-test artifacts accumulate harmlessly and
+# can be cleaned via App Builder UI if desired.
 # ---------------------------------------------------------------------------
 
-PROBE_2B5_LOV = 8950          # reserves 8950..8959 (LOV + up to 9 static rows)
-PROBE_2B5_AUTH = 8970
-PROBE_2B5_NAV_ITEM = 8980
-PROBE_2B5_APP_ITEM = 8990
+PROBE_2B5_NAV_ITEM = 8980  # nav_item still uses static id; name not in unique idx
+
+
+def _random_probe_suffix() -> str:
+    """6 hex chars, ~16M unique values per run."""
+    return secrets.token_hex(3).upper()
+
+
+def _random_probe_id() -> int:
+    """Random id in 8900..8998 inclusive (10 reserved slots above lov rows)."""
+    return 8900 + secrets.randbelow(99)
 
 
 def _cleanup_2b5_shared_components(app_id: int) -> None:
-    """Best-effort cleanup of 2B-5 shared components.
+    """Best-effort cleanup of 2B-5 shared components — see header comment.
 
-    Note: wwv_flow_imp_shared has no public REMOVE_LOV / REMOVE_AUTHENTICATION
-    / REMOVE_FLOW_ITEM / REMOVE_LIST_ITEM procs in APEX 24.2. The underlying
-    apex_240200.wwv_flow_* tables are not directly delete-able from a
-    workspace schema (definer's rights don't carry). The pragmatic test
-    strategy is: each test run uses fresh probe ids if the previous run's
-    ids leaked. The probe ids above (8950+) are deliberately high to leave
-    headroom; bump them if they ever collide. Live-test artifacts can be
-    cleaned via App Builder UI if needed.
+    Kept as a no-op shim so the existing nav_item test (which still uses
+    static id) keeps the same shape; randomized tests do per-id cleanup
+    inline using the id they actually created.
     """
-    # No-op: see docstring. Tests rely on fresh ids per run.
     return
 
 
@@ -876,15 +887,22 @@ def _query_first_list_id(app_id: int) -> int | None:
 
 
 def test_add_lov_dev_live(dev_state):
-    """Live DEV: add a static LOV with two values, verify via apex_application_lovs."""
+    """Live DEV: add a static LOV with two values, verify via apex_application_lovs.
+
+    Randomizes both lov_id and name per run to avoid WWV_FLOW_ITEMS_IDX3 /
+    LOV unique-name collisions with leftover state from prior runs.
+    """
     from apex_builder_mcp.tools.shared_components import apex_add_lov
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    suffix = _random_probe_suffix()
+    lov_id = _random_probe_id()
+    lov_name = f"ITEST_2B5_LOV_{suffix}"
     try:
         result = apex_add_lov(
             app_id=app_id,
-            lov_id=PROBE_2B5_LOV,
-            name="ITEST_2B5_LOV",
+            lov_id=lov_id,
+            name=lov_name,
             lov_type="STATIC",
             static_values=[
                 {"display": "Active", "return": "A"},
@@ -892,7 +910,7 @@ def test_add_lov_dev_live(dev_state):
             ],
         )
         assert result["dry_run"] is False
-        assert result["lov_id"] == PROBE_2B5_LOV
+        assert result["lov_id"] == lov_id
         assert result["static_value_count"] == 2
     finally:
         _cleanup_2b5_shared_components(app_id)
@@ -919,20 +937,27 @@ def test_list_lovs_dev_live(dev_state):
 
 
 def test_add_auth_scheme_dev_live(dev_state):
-    """Live DEV: add a custom auth scheme with PL/SQL function body."""
+    """Live DEV: add a custom auth scheme with PL/SQL function body.
+
+    Randomizes both auth_id and name per run to avoid uniqueness collisions
+    with leftover state.
+    """
     from apex_builder_mcp.tools.shared_components import apex_add_auth_scheme
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    suffix = _random_probe_suffix()
+    auth_id = _random_probe_id()
+    auth_name = f"ITEST_2B5_AUTH_{suffix}"
     try:
         result = apex_add_auth_scheme(
             app_id=app_id,
-            auth_id=PROBE_2B5_AUTH,
-            name="ITEST_2B5_AUTH",
+            auth_id=auth_id,
+            name=auth_name,
             scheme_type="NATIVE_CUSTOM",
             plsql_code="return :APP_USER is not null;",
         )
         assert result["dry_run"] is False
-        assert result["auth_id"] == PROBE_2B5_AUTH
+        assert result["auth_id"] == auth_id
     finally:
         _cleanup_2b5_shared_components(app_id)
 
@@ -965,19 +990,26 @@ def test_add_nav_item_dev_live(dev_state):
 
 
 def test_add_app_item_dev_live(dev_state):
-    """Live DEV: add an application-level item, verify via apex_application_items."""
+    """Live DEV: add an application-level item, verify via apex_application_items.
+
+    Randomizes both item_id and name per run; the (flow_id, name) unique
+    index WWV_FLOW_ITEMS_IDX3 is what was breaking us with static names.
+    """
     from apex_builder_mcp.tools.shared_components import apex_add_app_item
 
     app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    suffix = _random_probe_suffix()
+    item_id = _random_probe_id()
+    item_name = f"ITEST_2B5_GLOBAL_{suffix}"
     try:
         result = apex_add_app_item(
             app_id=app_id,
-            item_id=PROBE_2B5_APP_ITEM,
-            name="ITEST_2B5_GLOBAL",
+            item_id=item_id,
+            name=item_name,
             scope="APPLICATION",
         )
         assert result["dry_run"] is False
-        assert result["item_id"] == PROBE_2B5_APP_ITEM
+        assert result["item_id"] == item_id
         assert result["scope"] == "APPLICATION"
     finally:
         _cleanup_2b5_shared_components(app_id)
