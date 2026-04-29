@@ -562,3 +562,138 @@ def test_add_dynamic_action_dev_live(dev_state):
         assert result["da_action_id"] == PROBE_2B2_DA_ACTION
     finally:
         _cleanup_probe_2b2(app_id)
+
+
+# ---------------------------------------------------------------------------
+# 2B-3 region-types live DEV tests
+#
+# Probe ID range for 2B-3: 8700-8799 (avoids collision with 2B-2's 8600-8699).
+#
+# Note: apex_add_interactive_grid derives extra IG component ids from region_id:
+#   ig_id     = region_id
+#   report_id = region_id + 1
+#   view_id   = region_id + 2
+# So PROBE_2B3_IG_REGION reserves a 3-id span (8702, 8703, 8704).
+# ---------------------------------------------------------------------------
+
+PROBE_2B3_PAGE = 8700
+PROBE_2B3_FORM_REGION = 8701
+PROBE_2B3_IG_REGION = 8710  # reserves 8710..8712 for ig+report+view ids
+
+
+def _add_probe_page_2b3_via_sqlcl(app_id: int) -> None:
+    """Use ImportSession directly to add a probe page for 2B-3 tests."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  wwv_flow_imp_page.create_page("
+        f"p_id => {PROBE_2B3_PAGE}, "
+        f"p_name => 'ITEST_PROBE_2B3', "
+        f"p_alias => 'ITEST_PROBE_2B3', "
+        f"p_step_title => 'ITEST_PROBE_2B3', "
+        f"p_autocomplete_on_off => 'OFF', "
+        f"p_page_template_options => '#DEFAULT#'"
+        f");\n"
+    )
+    sess.execute(body)
+
+
+def _cleanup_probe_2b3(app_id: int) -> None:
+    """Best-effort cleanup of 2B-3 probe page (cascades to children)."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    sess = ImportSession(
+        sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+        workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+        application_id=app_id,
+        schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+    )
+    body = (
+        f"  begin wwv_flow_imp_page.remove_page("
+        f"p_flow_id => {app_id}, p_page_id => {PROBE_2B3_PAGE}"
+        f"); exception when others then null; end;\n"
+    )
+    try:
+        sess.execute(body)
+    except Exception:
+        pass  # best-effort
+
+
+def test_add_form_region_dev_live(dev_state):
+    """Live DEV: add probe page, then apex_add_form_region for table EMP."""
+    from apex_builder_mcp.tools.region_types import apex_add_form_region
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    # Use a small system table that's almost certainly accessible to the
+    # workspace schema. Fall back to USER_TABLES which is universal.
+    table_name = os.environ.get("APEX_TEST_FORM_TABLE", "USER_TABLES")
+    try:
+        _add_probe_page_2b3_via_sqlcl(app_id)
+        result = apex_add_form_region(
+            app_id=app_id,
+            page_id=PROBE_2B3_PAGE,
+            region_id=PROBE_2B3_FORM_REGION,
+            table_name=table_name,
+            name="ITEST_2B3_FORM",
+        )
+        assert result["dry_run"] is False
+        assert result["region_id"] == PROBE_2B3_FORM_REGION
+        assert result["after"]["regions"] == result["before"]["regions"] + 1
+    finally:
+        _cleanup_probe_2b3(app_id)
+
+
+def test_add_interactive_grid_dev_live(dev_state):
+    """Live DEV: add probe page, then apex_add_interactive_grid (4-proc compose)."""
+    from apex_builder_mcp.tools.region_types import apex_add_interactive_grid
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    try:
+        _add_probe_page_2b3_via_sqlcl(app_id)
+        result = apex_add_interactive_grid(
+            app_id=app_id,
+            page_id=PROBE_2B3_PAGE,
+            region_id=PROBE_2B3_IG_REGION,
+            sql_query="select table_name, tablespace_name from user_tables",
+            name="ITEST_2B3_IG",
+        )
+        assert result["dry_run"] is False
+        assert result["region_id"] == PROBE_2B3_IG_REGION
+        assert result["ig_id"] == PROBE_2B3_IG_REGION
+        assert result["report_id"] == PROBE_2B3_IG_REGION + 1
+        assert result["view_id"] == PROBE_2B3_IG_REGION + 2
+        assert result["after"]["regions"] == result["before"]["regions"] + 1
+    finally:
+        _cleanup_probe_2b3(app_id)
+
+
+def test_add_interactive_report_deferred_live(dev_state):
+    """apex_add_interactive_report is deferred - verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.region_types import apex_add_interactive_report
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_add_interactive_report(
+            app_id=100, page_id=8700, region_id=8702,
+            sql_query="select * from dual", name="x",
+        )
+    assert exc_info.value.code == "TOOL_DEFERRED"
+
+
+def test_add_master_detail_deferred_live(dev_state):
+    """apex_add_master_detail is deferred - verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.region_types import apex_add_master_detail
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_add_master_detail(
+            app_id=100, page_id=8700,
+            master_region_id=8710, detail_region_id=8720,
+            master_table="DEPT", detail_table="EMP",
+            link_column="DEPTNO", name="x",
+        )
+    assert exc_info.value.code == "TOOL_DEFERRED"

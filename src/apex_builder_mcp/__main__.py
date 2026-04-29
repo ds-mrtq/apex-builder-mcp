@@ -23,6 +23,7 @@ from apex_builder_mcp.tools import page_lifecycle as _page_lifecycle  # noqa: F4
 from apex_builder_mcp.tools import pages as _pages  # noqa: F401
 from apex_builder_mcp.tools import processes as _processes  # noqa: F401
 from apex_builder_mcp.tools import region_lifecycle as _region_lifecycle  # noqa: F401
+from apex_builder_mcp.tools import region_types as _region_types  # noqa: F401
 from apex_builder_mcp.tools import regions as _regions  # noqa: F401
 from apex_builder_mcp.tools.lazy import _get_loader
 
