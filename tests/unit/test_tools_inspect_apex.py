@@ -14,6 +14,7 @@ from apex_builder_mcp.tools.inspect_apex import (
     apex_list_pages,
     apex_list_processes,
     apex_list_regions,
+    apex_list_workspace_users,
 )
 
 
@@ -236,6 +237,45 @@ def test_list_processes(monkeypatch):
     assert result["processes"][0]["name"] == "PROC_OK"
     assert result["processes"][0]["code"] == "begin null; end;"
     assert result["processes"][1]["code"] is None
+
+
+def test_list_workspace_users(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        ("EREPORT", "ADMIN", "admin@example.com", "Yes", "Yes", "No", None),
+        ("EREPORT", "DEV1", "dev1@example.com", "No", "Yes", "No", None),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_workspace_users(workspace="EREPORT")
+    assert result["count"] == 2
+    assert result["workspace"] == "EREPORT"
+    assert result["users"][0]["user_name"] == "ADMIN"
+    assert result["users"][0]["is_admin"] == "Yes"
+    assert result["users"][1]["is_developer"] == "Yes"
+
+
+def test_list_workspace_users_no_filter(monkeypatch):
+    fake_cur = MagicMock()
+    fake_cur.fetchall.return_value = [
+        ("EREPORT", "ADMIN", "a@x", "Yes", "Yes", "No", None),
+        ("OTHER_WS", "USER1", "u@x", "No", "Yes", "No", None),
+    ]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value = fake_cur
+    fake_pool = MagicMock()
+    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_apex._get_pool", lambda: fake_pool
+    )
+    result = apex_list_workspace_users()
+    assert result["count"] == 2
+    assert result["workspace"] is None
 
 
 def test_list_dynamic_actions(monkeypatch):

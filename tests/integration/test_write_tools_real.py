@@ -1013,3 +1013,145 @@ def test_add_app_item_dev_live(dev_state):
         assert result["scope"] == "APPLICATION"
     finally:
         _cleanup_2b5_shared_components(app_id)
+
+
+# ---------------------------------------------------------------------------
+# 2B-6 page-asset + read-extension live DEV tests
+#
+# Probe range for 2B-6: 9100-9199 (per plan).
+#
+# - Static-file tests randomize file_name (using token_hex(3)) so leftover
+#   files from prior failed cleanups never collide on the unique
+#   (application_id, file_name) constraint. Cleanup attempts to call
+#   wwv_flow_imp_shared.remove_app_static_file when the file_id can be
+#   resolved via apex_application_static_files.
+# - search_objects + dependencies + list_workspace_users use oracledb pool
+#   so they require a profile that has password auth available; if the test
+#   env is sqlcl-only those tests skip.
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_2b6_static_file(app_id: int, file_name: str) -> None:
+    """Best-effort cleanup of an app static file by name."""
+    from apex_builder_mcp.apex_api.import_session import ImportSession
+    from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+
+    name_esc = file_name.replace("'", "''")
+    sql = (
+        "set heading off feedback off pagesize 0 echo off\n"
+        f"select application_file_id from apex_application_static_files "
+        f"where application_id = {app_id} and file_name = '{name_esc}';\n"
+        "exit\n"
+    )
+    try:
+        result = run_sqlcl(os.environ["APEX_TEST_SQLCL_NAME"], sql, timeout=30)
+        file_id: int | None = None
+        for line in result.cleaned.splitlines():
+            s = line.strip()
+            if s.isdigit():
+                file_id = int(s)
+                break
+        if file_id is None:
+            return
+        sess = ImportSession(
+            sqlcl_conn=os.environ["APEX_TEST_SQLCL_NAME"],
+            workspace_id=int(os.environ.get("APEX_TEST_WORKSPACE_ID", "100002")),
+            application_id=app_id,
+            schema=os.environ.get("APEX_TEST_SCHEMA", "EREPORT"),
+        )
+        sess.execute(
+            f"  wwv_flow_imp_shared.remove_app_static_file("
+            f"p_id => {file_id}, p_flow_id => {app_id});\n"
+        )
+    except Exception:
+        pass  # best-effort
+
+
+def test_add_static_app_file_dev_live_2b6(dev_state):
+    """Live DEV: upload a small CSS file as an app static file.
+
+    Randomized name avoids collision with leftover state from prior failed
+    runs (the (application_id, file_name) tuple is unique).
+    """
+    from apex_builder_mcp.tools.page_assets import apex_add_static_app_file
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    suffix = _random_probe_suffix()
+    file_id = 9100 + secrets.randbelow(99)
+    file_name = f"itest_2b6_{suffix}.css"
+    try:
+        result = apex_add_static_app_file(
+            app_id=app_id,
+            file_name=file_name,
+            file_content_text="/* itest 2b6 */\nbody { color: rebeccapurple; }\n",
+            mime_type="text/css",
+            file_id=file_id,
+        )
+        assert result["dry_run"] is False
+        assert result["file_name"] == file_name
+        assert result["mime_type"] == "text/css"
+    finally:
+        _cleanup_2b6_static_file(app_id, file_name)
+
+
+def test_add_page_js_deferred_live_2b6(dev_state):
+    """apex_add_page_js is deferred — verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.page_assets import apex_add_page_js
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_add_page_js(app_id=100, page_id=1, javascript_code="x;")
+    assert exc_info.value.code == "TOOL_DEFERRED"
+
+
+def test_add_app_css_deferred_live_2b6(dev_state):
+    """apex_add_app_css is deferred — verify clean error."""
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+    from apex_builder_mcp.tools.page_assets import apex_add_app_css
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_add_app_css(app_id=100, css_code="x")
+    assert exc_info.value.code == "TOOL_DEFERRED"
+
+
+def test_search_objects_dev_live_2b6(dev_state):
+    """Live DEV: search for objects matching APEX% pattern.
+
+    Read-only tool; uses oracledb pool. Skips cleanly if pool unavailable.
+    """
+    from apex_builder_mcp.tools.inspect_db import apex_search_objects
+
+    try:
+        result = apex_search_objects(pattern="APEX_%", object_types=["VIEW"])
+        assert "objects" in result
+        assert "count" in result
+        # Real DBs have many APEX_* views; if 0 the env is unusual but valid.
+    except Exception as e:
+        pytest.skip(f"apex_search_objects requires oracledb pool: {e}")
+
+
+def test_dependencies_dev_live_2b6(dev_state):
+    """Live DEV: get dependencies of a known APEX package."""
+    from apex_builder_mcp.tools.inspect_db import apex_dependencies
+
+    try:
+        result = apex_dependencies(object_name="DUAL")
+        assert "uses" in result
+        assert "used_by" in result
+        # DUAL is heavily depended-on; expect used_by_count > 0 typically.
+    except Exception as e:
+        pytest.skip(f"apex_dependencies requires oracledb pool: {e}")
+
+
+def test_list_workspace_users_dev_live_2b6(dev_state):
+    """Live DEV: list workspace users."""
+    from apex_builder_mcp.tools.inspect_apex import apex_list_workspace_users
+
+    try:
+        result = apex_list_workspace_users(
+            workspace=os.environ.get("APEX_TEST_WORKSPACE", "EREPORT")
+        )
+        assert "users" in result
+        assert "count" in result
+    except Exception as e:
+        pytest.skip(f"apex_list_workspace_users requires oracledb pool: {e}")

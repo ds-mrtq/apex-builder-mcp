@@ -341,6 +341,58 @@ def apex_list_processes(app_id: int, page_id: int) -> dict[str, Any]:
     return {"app_id": app_id, "page_id": page_id, "processes": rows, "count": len(rows)}
 
 
+@apex_tool(name="apex_list_workspace_users", category=Category.READ_APEX)
+def apex_list_workspace_users(workspace: str | None = None) -> dict[str, Any]:
+    """List APEX workspace users (optionally filtered by workspace).
+
+    Reads from `apex_workspace_apex_users`. Returns user_name, is_admin
+    (workspace_admin), is_developer (i.e. is_application_developer),
+    account_locked, last_login (date_last_login), workspace_name, and email.
+    """
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        if workspace:
+            cur.execute(
+                """
+                select workspace_name, user_name, email,
+                       is_admin, is_application_developer,
+                       account_locked, date_last_login
+                  from apex_workspace_apex_users
+                 where workspace_name = :ws
+                 order by user_name
+                """,
+                ws=workspace.upper(),
+            )
+        else:
+            cur.execute(
+                """
+                select workspace_name, user_name, email,
+                       is_admin, is_application_developer,
+                       account_locked, date_last_login
+                  from apex_workspace_apex_users
+                 order by workspace_name, user_name
+                """
+            )
+        users = [
+            {
+                "workspace_name": r[0],
+                "user_name": r[1],
+                "email": r[2],
+                "is_admin": r[3],
+                "is_developer": r[4],
+                "account_locked": r[5],
+                "last_login": str(r[6]) if r[6] else None,
+            }
+            for r in cur.fetchall()
+        ]
+    return {
+        "workspace": workspace.upper() if workspace else None,
+        "users": users,
+        "count": len(users),
+    }
+
+
 @apex_tool(name="apex_list_dynamic_actions", category=Category.READ_APEX)
 def apex_list_dynamic_actions(app_id: int, page_id: int) -> dict[str, Any]:
     """List dynamic action events on a page (event name, when-element, type)."""

@@ -22,6 +22,7 @@ from apex_builder_mcp.tools import items as _items  # noqa: F401
 from apex_builder_mcp.tools import items_bulk as _items_bulk  # noqa: F401
 from apex_builder_mcp.tools import layout_spec as _layout_spec  # noqa: F401
 from apex_builder_mcp.tools import lazy as _lazy  # noqa: F401
+from apex_builder_mcp.tools import page_assets as _page_assets  # noqa: F401
 from apex_builder_mcp.tools import page_lifecycle as _page_lifecycle  # noqa: F401
 from apex_builder_mcp.tools import pages as _pages  # noqa: F401
 from apex_builder_mcp.tools import processes as _processes  # noqa: F401
