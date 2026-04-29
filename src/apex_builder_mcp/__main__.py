@@ -10,6 +10,9 @@ from apex_builder_mcp.registry.tool_decorator import get_registered_tools
 # at server build time; the lazy loader then exposes them per category.
 from apex_builder_mcp.tools import audit as _audit  # noqa: F401
 from apex_builder_mcp.tools import buttons as _buttons  # noqa: F401
+from apex_builder_mcp.tools import (
+    charts_cards_calendar as _charts_cards_calendar,  # noqa: F401
+)
 from apex_builder_mcp.tools import connection as _conn  # noqa: F401
 from apex_builder_mcp.tools import dynamic_actions as _dynamic_actions  # noqa: F401
 from apex_builder_mcp.tools import inspect_apex as _inspect_apex  # noqa: F401
@@ -25,6 +28,7 @@ from apex_builder_mcp.tools import processes as _processes  # noqa: F401
 from apex_builder_mcp.tools import region_lifecycle as _region_lifecycle  # noqa: F401
 from apex_builder_mcp.tools import region_types as _region_types  # noqa: F401
 from apex_builder_mcp.tools import regions as _regions  # noqa: F401
+from apex_builder_mcp.tools import shared_components as _shared_components  # noqa: F401
 from apex_builder_mcp.tools.lazy import _get_loader
 
 
