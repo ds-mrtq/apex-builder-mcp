@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from apex_builder_mcp.apex_api.sql_guard import SqlGuardError
@@ -37,33 +35,50 @@ def _setup_state(env: str = "DEV") -> None:
 
 
 # ---------------------------------------------------------------------------
-# apex_run_sql (still uses pool — sqlcl path deferred)
+# apex_run_sql (now branches via query_run_sql helper)
 # ---------------------------------------------------------------------------
 
 
-def test_run_sql_rejects_ddl(monkeypatch):
-    fake_pool = MagicMock()
-    monkeypatch.setattr(
-        "apex_builder_mcp.tools.inspect_db._get_pool", lambda: fake_pool
-    )
+def test_run_sql_rejects_ddl():
     with pytest.raises(SqlGuardError):
         apex_run_sql("drop table emp")
 
 
-def test_run_sql_runs_select(monkeypatch):
-    fake_cur = MagicMock()
-    fake_cur.description = [("X", None, None, None, None, None, None)]
-    fake_cur.fetchmany.return_value = [(1,), (2,)]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cur
-    fake_pool = MagicMock()
-    fake_pool.acquire.return_value.__enter__.return_value = fake_conn
+def test_run_sql_runs_select_via_helper(monkeypatch):
+    _setup_state()
     monkeypatch.setattr(
-        "apex_builder_mcp.tools.inspect_db._get_pool", lambda: fake_pool
+        "apex_builder_mcp.tools.inspect_db.query_run_sql",
+        lambda profile, sql, max_rows: {
+            "columns": ["X"],
+            "rows": [[1], [2]],
+            "row_count": 2,
+        },
     )
     result = apex_run_sql("select 1 as x from dual")
     assert result["columns"] == ["X"]
     assert len(result["rows"]) == 2
+
+
+def test_run_sql_caps_max_rows(monkeypatch):
+    _setup_state()
+    captured: dict = {}
+
+    def fake_query(profile, sql, max_rows):
+        captured["max_rows"] = max_rows
+        return {"columns": ["X"], "rows": [], "row_count": 0}
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.inspect_db.query_run_sql", fake_query
+    )
+    apex_run_sql("select 1 as x from dual", max_rows=999_999)
+    # MAX_ROWS in inspect_db is 10_000 — caller cap should be applied
+    assert captured["max_rows"] == 10_000
+
+
+def test_run_sql_no_profile_raises():
+    with pytest.raises(ApexBuilderError) as exc_info:
+        apex_run_sql("select 1 from dual")
+    assert exc_info.value.code == "NOT_CONNECTED"
 
 
 # ---------------------------------------------------------------------------

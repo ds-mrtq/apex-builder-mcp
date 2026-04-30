@@ -26,19 +26,24 @@ Plan 2A read-tool extension (13):
   apex_list_items, apex_list_processes, apex_list_dynamic_actions,
   apex_list_tables, apex_describe_table, apex_get_source.
 
-Deferred
---------
-``apex_run_sql`` still requires the oracledb pool — sqlcl path deferred due
-to arbitrary SELECT parsing complexity (user supplies the SELECT, so no
-pipe-separated trick). Under sqlcl-only mode, callers should use
-``apex_search_objects``, ``apex_describe_table``, ``apex_get_source``, etc.
+Final closer (apex_run_sql)
+---------------------------
+``apex_run_sql`` accepts arbitrary user SELECT/WITH SQL. Under
+``auth_mode=sqlcl`` it uses SQLcl's ``set sqlformat csv`` output and the
+stdlib ``csv`` module to parse the result. SQLcl 26.1 emits a quoted
+header line followed by data rows (numbers unquoted, strings quoted,
+NULLs as empty quoted strings, dates rendered with the session NLS
+format). The parser strips banner/disconnect noise and honours
+``max_rows``.
 """
 from __future__ import annotations
 
+import csv
+import io
 from typing import Any
 
 from apex_builder_mcp.connection.auth_mode import AuthMode, resolve_auth_mode
-from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+from apex_builder_mcp.connection.sqlcl_subprocess import has_db_error, run_sqlcl
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
 
@@ -1965,3 +1970,132 @@ def query_get_source(
     if resolve_auth_mode(profile) is AuthMode.SQLCL:
         return _query_get_source_sqlcl(profile, object_name, object_type, schema)
     return _query_get_source_pool(object_name, object_type, schema)
+
+
+# ---------------------------------------------------------------------------
+# 20. apex_run_sql (DB) — arbitrary user SELECT
+# ---------------------------------------------------------------------------
+#
+# SQLcl path: rely on ``set sqlformat csv`` and parse via stdlib csv module.
+# Probe results (SQLcl 26.1 against Oracle 19c):
+#   * Header line: every column name double-quoted, comma-separated.
+#       "X","Y","TS"
+#   * Data: numbers emitted unquoted; strings/dates emitted in double-quotes.
+#       1,"hello",30-APR-26
+#   * NULL: empty double-quoted string ("").
+#   * Embedded commas/quotes inside string values are escaped per RFC 4180
+#     ("a, b, c" stays inside one quoted field; "has ""quotes""" doubles
+#     the embedded quote).
+#   * Empty result: header line emitted, no data rows.
+#   * ORA-/PLS- errors: rendered as banner/diagnostic block; no CSV header
+#     appears, so we detect them via ``has_db_error`` and surface the
+#     ORA-/PLS- line as ``SQL_EXEC_FAIL``.
+# The parser walks lines from the start, skips banner/blank/disconnect
+# lines, finds the first quoted-header line, then feeds subsequent
+# non-blank, non-disconnect lines to ``csv.reader``.
+
+
+def _is_csv_header(line: str) -> bool:
+    """Heuristic: SQLcl CSV header is one or more comma-separated quoted ids.
+
+    A quoted-only header always starts and ends with ``"`` and either
+    contains the inter-field separator ``","`` or is exactly one quoted
+    field (single-column query).
+    """
+    s = line.strip()
+    if not s.startswith('"') or not s.endswith('"'):
+        return False
+    return '","' in s or s.count('"') == 2
+
+
+def _query_run_sql_sqlcl(
+    profile: Profile, sql: str, max_rows: int
+) -> dict[str, Any]:
+    """Run arbitrary SELECT via SQLcl with CSV output format."""
+    wrapped = (
+        "set sqlformat csv\n"
+        "set heading on feedback off pagesize 50000 echo off termout on\n"
+        f"{sql.rstrip().rstrip(';')};\n"
+        "exit\n"
+    )
+    result = run_sqlcl(profile.sqlcl_name, wrapped, timeout=60)
+    if result.rc != 0:
+        raise ApexBuilderError(
+            code="SQLCL_QUERY_FAIL",
+            message=f"apex_run_sql via SQLcl failed: rc={result.rc}",
+            suggestion=f"Check sqlcl saved connection '{profile.sqlcl_name}'",
+        )
+    if has_db_error(result.stdout):
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if "ORA-" in stripped or "PLS-" in stripped:
+                raise ApexBuilderError(
+                    code="SQL_EXEC_FAIL",
+                    message=f"SQL execution error: {stripped}",
+                    suggestion="Check the SQL syntax and ensure objects exist",
+                )
+        # has_db_error matched but no ORA-/PLS- line could be extracted;
+        # fall through to a generic error.
+        raise ApexBuilderError(
+            code="SQL_EXEC_FAIL",
+            message="SQL execution error reported by SQLcl",
+            suggestion="Check the SQL syntax and ensure objects exist",
+        )
+
+    lines = result.stdout.splitlines()
+    csv_start = -1
+    for i, line in enumerate(lines):
+        if _is_csv_header(line):
+            csv_start = i
+            break
+    if csv_start < 0:
+        return {"columns": [], "rows": [], "row_count": 0}
+
+    csv_block: list[str] = []
+    for line in lines[csv_start:]:
+        stripped = line.strip()
+        if not stripped:
+            break
+        if stripped.startswith("Disconnected from"):
+            break
+        csv_block.append(line)
+
+    if not csv_block:
+        return {"columns": [], "rows": [], "row_count": 0}
+
+    reader = csv.reader(io.StringIO("\n".join(csv_block)))
+    parsed = list(reader)
+    if not parsed:
+        return {"columns": [], "rows": [], "row_count": 0}
+    headers = parsed[0]
+    data_rows = parsed[1 : max_rows + 1]
+    return {
+        "columns": headers,
+        "rows": data_rows,
+        "row_count": len(data_rows),
+    }
+
+
+def _query_run_sql_pool(sql: str, max_rows: int) -> dict[str, Any]:
+    """Pool path — same logic as before refactor."""
+    pool = _get_pool()
+    with pool.acquire() as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = [list(r) for r in cur.fetchmany(max_rows)]
+    return {"columns": cols, "rows": rows, "row_count": len(rows)}
+
+
+def query_run_sql(
+    profile: Profile, sql: str, max_rows: int
+) -> dict[str, Any]:
+    """Run SELECT and return {columns, rows, row_count}.
+
+    Branches on ``profile.auth_mode``:
+      * sqlcl  -> ``_query_run_sql_sqlcl`` (CSV output, csv module parse)
+      * password -> ``_query_run_sql_pool`` (oracledb pool)
+    """
+    if resolve_auth_mode(profile) is AuthMode.SQLCL:
+        return _query_run_sql_sqlcl(profile, sql, max_rows)
+    return _query_run_sql_pool(sql, max_rows)

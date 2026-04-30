@@ -1,14 +1,9 @@
 """Read-only DB inspection tools (auto-loaded after apex_connect).
 
-All tools except ``apex_run_sql`` branch on ``profile.auth_mode`` via the
-shared helpers in ``tools/_read_helpers.py``.
-
-``apex_run_sql`` still requires the oracledb pool — the SQLcl path is
-deferred due to arbitrary-SELECT parsing complexity (the user supplies
-the SELECT, so the pipe-separator marshalling trick used elsewhere does
-not apply). Under sqlcl-only mode it will raise NOT_CONNECTED via the
-pool path; callers should use ``apex_search_objects``, ``apex_describe_table``,
-``apex_get_source``, etc., for common cases.
+All tools branch on ``profile.auth_mode`` via the shared helpers in
+``tools/_read_helpers.py`` — including ``apex_run_sql``, which uses
+SQLcl's CSV output format under ``auth_mode=sqlcl`` and the oracledb
+pool under ``auth_mode=password``.
 """
 from __future__ import annotations
 
@@ -26,6 +21,7 @@ from apex_builder_mcp.tools._read_helpers import (
     query_describe_table,
     query_get_source,
     query_list_tables,
+    query_run_sql,
     query_search_objects,
 )
 
@@ -38,11 +34,6 @@ ALLOWED_OBJECT_TYPES = {
 # Pattern for `apex_search_objects` LIKE-input:
 # alphanumeric, _, $, # plus SQL LIKE wildcards (% and _).
 _PATTERN_RE = re.compile(r"^[A-Za-z0-9_$#%]+$")
-
-
-def _get_pool() -> Any:
-    from apex_builder_mcp.tools.connection import _get_or_create_pool
-    return _get_or_create_pool()
 
 
 def _require_profile() -> Profile:
@@ -64,21 +55,16 @@ def apex_run_sql(sql: str, max_rows: int = 1000) -> dict[str, Any]:
     DB user (configured per scripts/grant_mcp_user.sql) provides additional
     Layer 1 defense - even if filter is bypassed, user has no DDL grants.
 
-    NOTE: this tool requires ``auth_mode=password`` (oracledb pool). Under
-    ``auth_mode=sqlcl``, the SQLcl path is deferred due to arbitrary-SELECT
-    parsing complexity. Use apex_search_objects / apex_describe_table /
-    apex_get_source for the common metadata queries instead.
+    Branches on ``profile.auth_mode``:
+      * sqlcl  -> SQLcl subprocess with ``set sqlformat csv``, parsed via
+        the stdlib ``csv`` module.
+      * password -> oracledb pool (existing behavior).
     """
     is_safe_select(sql, raise_on_fail=True)
     if max_rows > MAX_ROWS:
         max_rows = MAX_ROWS
-    pool = _get_pool()
-    with pool.acquire() as conn:
-        cur = conn.cursor()
-        cur.execute(sql)
-        cols = [d[0] for d in cur.description] if cur.description else []
-        rows = [list(r) for r in cur.fetchmany(max_rows)]
-    return {"columns": cols, "rows": rows, "row_count": len(rows)}
+    profile = _require_profile()
+    return query_run_sql(profile, sql, max_rows)
 
 
 @apex_tool(name="apex_list_tables", category=Category.READ_DB)

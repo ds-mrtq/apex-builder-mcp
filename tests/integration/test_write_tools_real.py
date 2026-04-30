@@ -1672,3 +1672,35 @@ def test_delete_app_missing_app_silently_ok_live_2b8(dev_state):
     assert result["dry_run"] is False
     assert result["deleted"] is True
     assert result["app_id"] == missing_id
+
+
+# ---------------------------------------------------------------------------
+# apex_run_sql sqlcl-fallback (closes last read-tool pool gap)
+# ---------------------------------------------------------------------------
+
+
+def test_run_sql_dev_live_via_sqlcl(dev_state):
+    """apex_run_sql should now work under sqlcl auth_mode."""
+    from apex_builder_mcp.tools.inspect_db import apex_run_sql
+
+    result = apex_run_sql(
+        "select application_id, application_name from apex_applications "
+        "where workspace = 'EREPORT' order by application_id "
+        "fetch first 3 rows only"
+    )
+    assert result["row_count"] >= 1
+    assert "APPLICATION_ID" in [c.upper() for c in result["columns"]]
+
+
+def test_run_sql_handles_empty_result_via_sqlcl(dev_state):
+    from apex_builder_mcp.tools.inspect_db import apex_run_sql
+
+    result = apex_run_sql("select 1 as x from apex_applications where 1 = 0")
+    assert result["row_count"] == 0
+
+
+def test_run_sql_handles_null_via_sqlcl(dev_state):
+    from apex_builder_mcp.tools.inspect_db import apex_run_sql
+
+    result = apex_run_sql("select null as x, 'hello' as y from dual")
+    assert result["row_count"] == 1
