@@ -54,7 +54,7 @@
 
 6. **Generator atomicity is best-effort, not transactional** — each underlying tool opens its own ImportSession (auto-commits per session). On mid-way failure, generators raise `GENERATOR_PARTIAL` with `metadata.created` listing what succeeded; user must manually clean up.
 
-7. **Static app files limited to ~30KB inline-text** — chunked LOB construction needed for bigger CSS/JS. Phase 3 follow-up.
+7. **Static app files now support up to 1 MB via chunked LOB construction** — payloads >30 KB switch to `dbms_lob.createtemporary` + N x `dbms_lob.append(hextoraw('...'))` with 8 KB raw chunks (16 KB hex chars per literal, well under PL/SQL VARCHAR2 cap). Verified live at 64 KB (post-mvp-2.0 polish).
 
 8. **Read-tool oracledb pool gap persists** — 4 read tools (apex_list_lovs, apex_search_objects, apex_dependencies, apex_list_workspace_users; plus apex_get_app_details and apex_validate_app from 2B-8) currently use `_get_pool()` which is empty under `auth_mode=sqlcl`. They skip cleanly in live tests but block real-world use under sqlcl-only profile. Plan 2A pool-gap fix addressed write tools; read tools need similar SQLcl-subprocess fallback.
 
@@ -90,7 +90,7 @@
 - **2B-9 Design System bridge** — apply DS spec → Theme Style + Custom CSS (USP feature per spec)
 - **2B-10 PROD arm** — sandbox PROD-clone with allowlist + backup-before-write + rollback (power-user feature)
 - **Read-tool sqlcl-fallback** — fix oracledb pool gap for 4-6 read tools blocked under sqlcl-only auth
-- **Phase 3 polish** — retry deferred tools as APEX patches add native procs; chunked LOB for large static files; SQL parser for IR column discovery
+- **Phase 3 polish** — retry deferred tools as APEX patches add native procs; SQL parser for IR column discovery (chunked LOB for static files done post-mvp-2.0)
 
 ## Next-step recommendations (priority-ordered)
 

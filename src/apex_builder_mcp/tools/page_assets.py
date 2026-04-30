@@ -31,12 +31,20 @@ Three tools planned (1 implemented + 2 deferred):
   * apex_add_static_app_file(app_id, file_name, file_content_text,
                               mime_type='text/plain', file_id=None)  [IMPLEMENTED]
       Wraps `WWV_FLOW_IMP_SHARED.CREATE_APP_STATIC_FILE`. Empirically
-      verified on app 100. Converts text content to BLOB via
-      `utl_raw.cast_to_raw` (requires content <= ~32KB single-RAW limit;
-      larger payloads should use a multi-call BLOB build, which is
-      deferred to Phase 3). Verification queries
-      `apex_application_static_files.application_file_id` by
-      (application_id, file_name) tuple.
+      verified on app 100. Two BLOB-construction paths based on payload
+      size:
+        * ≤30 KB: single `utl_raw.cast_to_raw('<text>')` cast (fast,
+          readable SQL preview).
+        * >30 KB and ≤1 MB: chunked construction via
+          `dbms_lob.createtemporary(v_blob, true)` followed by N calls
+          to `dbms_lob.append(v_blob, hextoraw('<chunk_hex>'))`, where
+          each chunk is 8 KB of raw bytes (16 KB hex chars per literal,
+          well under the 32 KB PL/SQL VARCHAR2 literal cap).
+        * >1 MB: rejected with CONTENT_TOO_LARGE (single SQLcl script
+          would exceed practical size; file-based bulk upload is the
+          better approach beyond that).
+      Verification queries `apex_application_static_files.application_file_id`
+      by (application_id, file_name) tuple.
 """
 from __future__ import annotations
 
@@ -57,9 +65,50 @@ from apex_builder_mcp.tools._write_helpers import (
     query_workspace_id,
 )
 
-# 30 KB limit for utl_raw.cast_to_raw single-shot payloads
-# (Oracle RAW max is 32767 bytes; we leave a safety margin for UTF-8 expansion).
-_MAX_INLINE_TEXT_BYTES = 30 * 1024
+# Single-shot path (utl_raw.cast_to_raw) limit. Oracle RAW max is 32767 bytes;
+# we leave a safety margin for UTF-8 expansion.
+_INLINE_RAW_CAST_THRESHOLD = 30 * 1024
+
+# Per-chunk raw-byte size for chunked dbms_lob.append path. 8 KB raw → 16 KB
+# hex characters per PL/SQL string literal, well under the 32 KB VARCHAR2 cap.
+_HEX_CHUNK_RAW_BYTES = 8 * 1024
+
+# Hard upper bound for chunked uploads (1 MB). Beyond this the single-script
+# size becomes unwieldy and a file-based bulk-upload approach is preferable.
+_MAX_FILE_BYTES = 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# BLOB-construction helper
+# ---------------------------------------------------------------------------
+
+
+def _build_blob_construction_plsql(content_bytes: bytes) -> str:
+    """Return the PL/SQL fragment that produces a populated `v_blob` BLOB.
+
+    Caller wraps this in `declare v_blob blob; begin ... end;` and adds the
+    `wwv_flow_imp_shared.create_app_static_file` call after.
+
+    Two strategies:
+      * Small (≤30 KB raw): single `v_blob := utl_raw.cast_to_raw('<text>')`
+        — keeps the SQL preview compact and readable.
+      * Large (>30 KB): `dbms_lob.createtemporary` + N x `dbms_lob.append(
+        v_blob, hextoraw('<8KB-hex-chunk>'))`. Hex chars are [0-9A-F] so no
+        single-quote escaping is needed inside the literals.
+    """
+    if len(content_bytes) <= _INLINE_RAW_CAST_THRESHOLD:
+        text = content_bytes.decode("utf-8")
+        text_esc = text.replace("'", "''")
+        return f"    v_blob := utl_raw.cast_to_raw('{text_esc}');\n"
+
+    parts: list[str] = ["    dbms_lob.createtemporary(v_blob, true);\n"]
+    for offset in range(0, len(content_bytes), _HEX_CHUNK_RAW_BYTES):
+        chunk = content_bytes[offset : offset + _HEX_CHUNK_RAW_BYTES]
+        hex_str = chunk.hex().upper()
+        parts.append(
+            f"    dbms_lob.append(v_blob, hextoraw('{hex_str}'));\n"
+        )
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +218,11 @@ def apex_add_static_app_file(
     Wraps WWV_FLOW_IMP_SHARED.CREATE_APP_STATIC_FILE. DEV-only.
     TEST returns dry-run preview. PROD rejects.
 
-    Content size limit: ~30 KB (Oracle RAW max minus safety margin).
-    Larger files require chunked LOB construction — deferred to Phase 3.
+    Content size limits:
+      * ≤30 KB → single utl_raw.cast_to_raw cast (compact SQL preview).
+      * >30 KB and ≤1 MB → chunked BLOB construction via
+        dbms_lob.createtemporary + N x dbms_lob.append(hextoraw(...)).
+      * >1 MB → rejected with CONTENT_TOO_LARGE.
 
     Verification: queries apex_application_static_files by
     (application_id, file_name).
@@ -186,29 +238,30 @@ def apex_add_static_app_file(
 
     # Size check (UTF-8 byte length)
     content_bytes = file_content_text.encode("utf-8")
-    if len(content_bytes) > _MAX_INLINE_TEXT_BYTES:
+    if len(content_bytes) > _MAX_FILE_BYTES:
         raise ApexBuilderError(
             code="CONTENT_TOO_LARGE",
             message=(
                 f"file_content_text is {len(content_bytes)} bytes; "
-                f"limit is {_MAX_INLINE_TEXT_BYTES} bytes"
+                f"limit is {_MAX_FILE_BYTES} bytes (1 MB)"
             ),
             suggestion=(
-                "Split into multiple static files, or wait for chunked-BLOB "
-                "support (Phase 3)."
+                "Split into multiple static files. Files >1 MB are not "
+                "supported via SQLcl-script upload; use APEX App Builder UI "
+                "Shared Components > Static Application Files for bulk uploads."
             ),
         )
 
     name_esc = file_name.replace("'", "''")
     mime_esc = mime_type.replace("'", "''")
-    content_esc = file_content_text.replace("'", "''")
     id_clause = f"p_id => {file_id}, " if file_id is not None else ""
+
+    blob_construction = _build_blob_construction_plsql(content_bytes)
 
     plsql_body = f"""  declare
     v_blob blob;
   begin
-    v_blob := utl_raw.cast_to_raw('{content_esc}');
-    wwv_flow_imp_shared.create_app_static_file(
+{blob_construction}    wwv_flow_imp_shared.create_app_static_file(
       {id_clause}p_flow_id => {app_id},
       p_file_name => '{name_esc}',
       p_mime_type => '{mime_esc}',

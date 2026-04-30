@@ -1089,6 +1089,66 @@ def test_add_static_app_file_dev_live_2b6(dev_state):
         _cleanup_2b6_static_file(app_id, file_name)
 
 
+def test_add_static_app_file_chunked_dev_live(dev_state):
+    """Live DEV: upload a ~64 KB CSS file via chunked-LOB path.
+
+    Exercises dbms_lob.createtemporary + dbms_lob.append(hextoraw('...'))
+    construction path for content >30 KB. Verifies the file appears in
+    apex_application_static_files and its byte length matches the upload.
+    """
+    from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
+    from apex_builder_mcp.tools.page_assets import apex_add_static_app_file
+
+    app_id = int(os.environ.get("APEX_TEST_SOURCE_APP_ID", "100"))
+    suffix = _random_probe_suffix()
+    file_id = 9100 + secrets.randbelow(99)
+    file_name = f"itest_2b6_chunked_{suffix}.css"
+
+    # Build a deterministic ~64 KB ASCII payload with recognizable shape so a
+    # post-upload byte-length check can confirm the chunked roundtrip.
+    block = "/* chunk-block */\n.cls{color:rebeccapurple;}\n"
+    repeats = (64 * 1024) // len(block) + 1
+    content = (block * repeats)[: 64 * 1024]
+    assert len(content) == 64 * 1024
+
+    try:
+        result = apex_add_static_app_file(
+            app_id=app_id,
+            file_name=file_name,
+            file_content_text=content,
+            mime_type="text/css",
+            file_id=file_id,
+        )
+        assert result["dry_run"] is False
+        assert result["file_name"] == file_name
+        assert result["content_bytes"] == 64 * 1024
+
+        # Verify the uploaded BLOB length matches what we sent.
+        name_esc = file_name.replace("'", "''")
+        sql = (
+            "set heading off feedback off pagesize 0 echo off\n"
+            f"select dbms_lob.getlength(file_content) "
+            f"from apex_application_static_files "
+            f"where application_id = {app_id} and file_name = '{name_esc}';\n"
+            "exit\n"
+        )
+        sqlcl_result = run_sqlcl(
+            os.environ["APEX_TEST_SQLCL_NAME"], sql, timeout=30
+        )
+        actual_bytes = None
+        for line in sqlcl_result.cleaned.splitlines():
+            s = line.strip()
+            if s.isdigit():
+                actual_bytes = int(s)
+                break
+        assert actual_bytes == 64 * 1024, (
+            f"uploaded BLOB length mismatch: expected {64*1024}, "
+            f"got {actual_bytes}"
+        )
+    finally:
+        _cleanup_2b6_static_file(app_id, file_name)
+
+
 def test_add_page_js_deferred_live_2b6(dev_state):
     """apex_add_page_js is deferred — verify clean error."""
     from apex_builder_mcp.schema.errors import ApexBuilderError

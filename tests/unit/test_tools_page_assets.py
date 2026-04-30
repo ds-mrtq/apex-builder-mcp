@@ -1,10 +1,12 @@
-"""Unit tests for tools/page_assets.py (Plan 2B-6).
+"""Unit tests for tools/page_assets.py (Plan 2B-6 + chunked-LOB extension).
 
 Coverage:
   * apex_add_page_js              - 1 test (deferred stub returns TOOL_DEFERRED)
   * apex_add_app_css              - 1 test (deferred stub returns TOOL_DEFERRED)
-  * apex_add_static_app_file      - 6 tests (NOT_CONNECTED, PROD, TEST,
-                                    DEV, CONTENT_TOO_LARGE, file_id passthrough)
+  * apex_add_static_app_file      - 10 tests (NOT_CONNECTED, PROD, TEST,
+                                    DEV, CONTENT_TOO_LARGE, file_id passthrough,
+                                    chunked dry-run preview, chunked DEV exec,
+                                    chunk count math, oversize rejection at 1MB)
 """
 from __future__ import annotations
 
@@ -112,8 +114,9 @@ def test_add_static_app_file_rejects_on_prod():
 
 
 def test_add_static_app_file_rejects_oversize():
+    """Files >1 MB are rejected (chunked-LOB upper bound)."""
     _setup_state(env="DEV")
-    big = "x" * (35 * 1024)
+    big = "x" * (1024 * 1024 + 1)  # 1 MB + 1 byte
     with pytest.raises(ApexBuilderError) as exc_info:
         apex_add_static_app_file(
             app_id=100, file_name="big.css", file_content_text=big
@@ -175,3 +178,90 @@ def test_add_static_app_file_escapes_single_quotes():
     assert result["dry_run"] is True
     # Ensure 'hi' inside content gets ''hi'' (Oracle quote-escaping)
     assert "''hi''" in result["sql_preview"]
+
+
+# ---------------------------------------------------------------------------
+# Chunked-LOB upload (>30 KB, ≤1 MB)
+# ---------------------------------------------------------------------------
+
+
+def test_add_static_app_file_chunked_dry_run_preview():
+    """Content >30 KB switches to dbms_lob.createtemporary + append loop."""
+    _setup_state(env="TEST")
+    # 50 KB of ASCII content -> hex chunks; well above 30 KB threshold
+    content = "x" * (50 * 1024)
+    result = apex_add_static_app_file(
+        app_id=100,
+        file_name="big.css",
+        file_content_text=content,
+        mime_type="text/css",
+    )
+    assert result["dry_run"] is True
+    preview = result["sql_preview"]
+    # Chunked path uses dbms_lob.createtemporary, not utl_raw.cast_to_raw
+    assert "dbms_lob.createtemporary" in preview
+    assert "dbms_lob.append" in preview
+    assert "hextoraw(" in preview
+    assert "utl_raw.cast_to_raw" not in preview
+    # Multiple chunks expected for 50 KB at 8 KB/chunk → 7 chunks
+    assert preview.count("dbms_lob.append") >= 6
+    assert result["content_bytes"] == 50 * 1024
+
+
+def test_add_static_app_file_small_uses_single_cast():
+    """Small content (≤30 KB) keeps the single utl_raw.cast_to_raw path."""
+    _setup_state(env="TEST")
+    content = "y" * (10 * 1024)  # 10 KB - well under threshold
+    result = apex_add_static_app_file(
+        app_id=100,
+        file_name="small.css",
+        file_content_text=content,
+    )
+    preview = result["sql_preview"]
+    assert "utl_raw.cast_to_raw" in preview
+    assert "dbms_lob.createtemporary" not in preview
+
+
+def test_add_static_app_file_chunked_executes_on_dev(monkeypatch):
+    """DEV path with chunked content invokes ImportSession.execute once."""
+    _setup_state(env="DEV")
+    fake_sess = _patch_live_path(monkeypatch)
+    content = "z" * (40 * 1024)  # 40 KB
+    result = apex_add_static_app_file(
+        app_id=100,
+        file_name="large.js",
+        file_content_text=content,
+        mime_type="text/javascript",
+    )
+    assert result["dry_run"] is False
+    fake_sess.execute.assert_called_once()
+    body = fake_sess.execute.call_args[0][0]
+    assert "dbms_lob.createtemporary" in body
+    assert "dbms_lob.append" in body
+    assert "wwv_flow_imp_shared.create_app_static_file" in body
+
+
+def test_add_static_app_file_chunk_count_matches_size():
+    """Verify chunk math: 64 KB content at 8 KB/chunk → 8 chunks exactly."""
+    _setup_state(env="TEST")
+    content = "a" * (64 * 1024)
+    result = apex_add_static_app_file(
+        app_id=100,
+        file_name="exact.css",
+        file_content_text=content,
+    )
+    preview = result["sql_preview"]
+    assert preview.count("dbms_lob.append") == 8
+
+
+def test_add_static_app_file_accepts_at_one_mb():
+    """Exactly 1 MB content is accepted (boundary inclusive)."""
+    _setup_state(env="TEST")
+    content = "b" * (1024 * 1024)  # exactly 1 MB
+    result = apex_add_static_app_file(
+        app_id=100,
+        file_name="onembr.css",
+        file_content_text=content,
+    )
+    assert result["dry_run"] is True
+    assert result["content_bytes"] == 1024 * 1024
