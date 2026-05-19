@@ -29,7 +29,12 @@ def pytest_collection_modifyitems(
 
 @pytest.fixture
 def tmp_profiles_yaml(tmp_path):
-    """Sample profiles.yaml for tests."""
+    """Sample profiles.yaml for tests.
+
+    Existing tests target the password auth path, so DEV1/TEST1/PROD are
+    explicitly auth_mode: password. For sqlcl-path tests, write a dedicated
+    yaml inline (auth_mode defaults to sqlcl per the schema).
+    """
     yaml_path = tmp_path / "profiles.yaml"
     yaml_path.write_text(
         """
@@ -38,17 +43,20 @@ profiles:
     sqlcl_name: HTC_DEV1
     environment: DEV
     workspace: HTC_OPS
+    auth_mode: password
   TEST1:
     sqlcl_name: HTC_TEST1
     environment: TEST
     workspace: HTC_OPS
     require_dry_run: true
+    auth_mode: password
   PROD:
     sqlcl_name: HTC_PROD
     environment: PROD
     workspace: HTC_OPS
     require_dry_run: true
     block_destructive: true
+    auth_mode: password
 """.strip(),
         encoding="utf-8",
     )

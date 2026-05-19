@@ -8,6 +8,12 @@ from typing import Any, Callable, Literal, TypeVar
 
 import yaml
 
+from apex_builder_mcp.connection.auth_mode import (
+    AuthMode,
+    AuthResolutionError,
+    resolve_auth_mode,
+    verify_sqlcl_connection,
+)
 from apex_builder_mcp.connection.credential import get_password, set_password
 from apex_builder_mcp.connection.pool import ApexBuilderPool
 from apex_builder_mcp.connection.profile import load_profile, load_profiles
@@ -139,13 +145,21 @@ def _reset_pool_for_tests() -> None:
 def apex_connect(profile_name: str) -> dict[str, Any]:
     """Connect to DB using a configured profile.
 
-    Never prompts interactively — MCP stdio transport has no TTY, and a getpass
-    read against a JSON-RPC pipe would block the server forever. If no password
-    is stored in the OS credential store, raises CRED_MISSING with a pointer to
-    apex_setup_profile.
+    Branches on profile.auth_mode:
 
-    Wrapped in an overall budget (APEX_BUILDER_CONNECT_TIMEOUT_SEC, default 60s);
-    on timeout the error names the stage that was running.
+    - ``sqlcl`` (default): SQLcl saved-connection owns both metadata and
+      credentials in its own encrypted store. We do NOT register a password
+      in the OS keyring and do NOT open an oracledb pool. We verify the
+      saved-conn works (`select 'OK_CHECK' from dual`) and mark CONNECTED.
+      All read/write helpers route via ``run_sqlcl(profile.sqlcl_name, ...)``.
+
+    - ``password``: We resolve the connection metadata, fetch the password
+      from the OS keyring, and open an oracledb thin-mode pool. If keyring
+      has no entry, raises CRED_MISSING — never an interactive prompt
+      (MCP stdio has no TTY; getpass would block on a JSON-RPC pipe).
+
+    Wrapped in an overall budget (APEX_BUILDER_CONNECT_TIMEOUT_SEC, default
+    60s); on timeout the error names the stage that was running.
     """
     timeout = _connect_timeout_sec()
     stage: dict[str, str] = {"name": "init"}
@@ -153,25 +167,53 @@ def apex_connect(profile_name: str) -> dict[str, Any]:
     def body() -> dict[str, Any]:
         stage["name"] = "load_profile"
         profile = load_profile(profile_name, PROFILES_YAML)
+        mode = resolve_auth_mode(profile)
 
         stage["name"] = "read_connection_metadata"
         md = read_connection_metadata(profile.sqlcl_name)
 
-        stage["name"] = "get_password"
-        password = get_password(profile_name, prompt_if_missing=False)
-        if not password:
-            raise ApexBuilderError(
-                code="CRED_MISSING",
-                message=f"No password stored for profile {profile_name!r}",
-                suggestion=(
-                    "Run apex_setup_profile to register this profile and its "
-                    "password in the OS credential store before apex_connect."
-                ),
-            )
+        if mode is AuthMode.SQLCL:
+            stage["name"] = "verify_sqlcl_connection"
+            try:
+                verify_sqlcl_connection(profile.sqlcl_name)
+            except AuthResolutionError as e:
+                raise ApexBuilderError(
+                    code="SQLCL_CONN_UNREACHABLE",
+                    message=(
+                        f"SQLcl saved-connection {profile.sqlcl_name!r} "
+                        f"failed health check"
+                    ),
+                    suggestion=(
+                        "Run `sql -name {name}` manually to debug, or "
+                        "re-register the saved connection via "
+                        "`connmgr add`. Original: {orig}".format(
+                            name=profile.sqlcl_name, orig=str(e)
+                        )
+                    ),
+                ) from e
+        else:  # AuthMode.PASSWORD
+            stage["name"] = "get_password"
+            password = get_password(profile_name, prompt_if_missing=False)
+            if not password:
+                raise ApexBuilderError(
+                    code="CRED_MISSING",
+                    message=(
+                        f"No password stored for profile {profile_name!r} "
+                        f"(auth_mode=password)"
+                    ),
+                    suggestion=(
+                        "Run apex_setup_profile to register this profile "
+                        "and its password in the OS credential store, or "
+                        "switch the profile to auth_mode: sqlcl to use "
+                        "the SQLcl saved-connection's own credentials."
+                    ),
+                )
 
-        stage["name"] = "oracledb_connect"
-        pool = _get_or_create_pool()
-        pool.connect(profile=profile, dsn=md.dsn, user=md.user, password=password)
+            stage["name"] = "oracledb_connect"
+            pool = _get_or_create_pool()
+            pool.connect(
+                profile=profile, dsn=md.dsn, user=md.user, password=password
+            )
 
         stage["name"] = "post_connect"
         state = get_state()
@@ -186,6 +228,7 @@ def apex_connect(profile_name: str) -> dict[str, Any]:
             "environment": profile.environment,
             "workspace": profile.workspace,
             "user": md.user,
+            "auth_mode": mode.value,
             "loaded_categories": sorted(c.value for c in loader.loaded_categories()),
         }
 
@@ -219,11 +262,18 @@ def apex_disconnect() -> dict[str, Any]:
 
 @apex_tool(name="apex_status", category=Category.CORE)
 def apex_status() -> dict[str, Any]:
-    """Return current connection state. Safe to call from any state."""
+    """Return current connection state. Safe to call from any state.
+
+    Note: in ``auth_mode: sqlcl`` profiles ``pool_connected`` will be False
+    even after a successful apex_connect — that path delegates queries to
+    SQLcl subprocesses and never opens an oracledb pool. Use ``state`` and
+    ``auth_mode`` to interpret readiness.
+    """
     state = get_state()
     pool = _get_or_create_pool()
     return {
         "state": state.status,
         "profile": state.profile.sqlcl_name if state.profile else None,
+        "auth_mode": state.profile.auth_mode if state.profile else None,
         "pool_connected": pool.is_connected,
     }

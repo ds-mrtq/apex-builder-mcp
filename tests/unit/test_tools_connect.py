@@ -133,6 +133,126 @@ def test_connect_timeout_names_active_stage(monkeypatch, tmp_profiles_yaml):
     assert elapsed < 10, f"timeout should fire ~5s, got {elapsed:.1f}s"
 
 
+@pytest.fixture
+def tmp_sqlcl_profile_yaml(tmp_path):
+    """Profile yaml with explicit auth_mode: sqlcl (matches the production default)."""
+    p = tmp_path / "profiles_sqlcl.yaml"
+    p.write_text(
+        "profiles:\n"
+        "  DEV1:\n"
+        "    sqlcl_name: ereport_test8001\n"
+        "    environment: DEV\n"
+        "    workspace: EREPORT\n"
+        "    auth_mode: sqlcl\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_connect_sqlcl_mode_skips_keyring_and_pool(monkeypatch, tmp_sqlcl_profile_yaml):
+    """auth_mode=sqlcl: never touch keyring, never open oracledb pool.
+
+    Validates the design intent — SQLcl saved-conn owns credentials in its
+    own encrypted store; Python layer must not duplicate the password.
+    """
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.PROFILES_YAML", tmp_sqlcl_profile_yaml
+    )
+
+    fake_md = MagicMock()
+    fake_md.dsn = "ebstest.example:1522/TEST1"
+    fake_md.user = "EREPORT"
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.read_connection_metadata",
+        lambda name: fake_md,
+    )
+
+    # If get_password gets called at all, fail the test.
+    def must_not_call_get_password(*args, **kwargs):
+        raise AssertionError("get_password must NOT be called in sqlcl mode")
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.get_password", must_not_call_get_password
+    )
+
+    fake_pool = MagicMock()
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.ApexBuilderPool", lambda: fake_pool
+    )
+
+    verify_calls: list[str] = []
+
+    def fake_verify(name):
+        verify_calls.append(name)
+        return True
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.verify_sqlcl_connection", fake_verify
+    )
+
+    result = apex_connect(profile_name="DEV1")
+
+    assert result["state"] == "CONNECTED:DEV"
+    assert result["auth_mode"] == "sqlcl"
+    assert verify_calls == ["ereport_test8001"]
+    fake_pool.connect.assert_not_called()
+
+
+def test_connect_sqlcl_mode_raises_when_saved_conn_unhealthy(
+    monkeypatch, tmp_sqlcl_profile_yaml
+):
+    """If verify_sqlcl_connection fails, surface SQLCL_CONN_UNREACHABLE clearly."""
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.PROFILES_YAML", tmp_sqlcl_profile_yaml
+    )
+    fake_md = MagicMock()
+    fake_md.dsn = "x"
+    fake_md.user = "u"
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.read_connection_metadata", lambda n: fake_md
+    )
+
+    from apex_builder_mcp.connection.auth_mode import AuthResolutionError
+
+    def boom(name):
+        raise AuthResolutionError("sql -name ereport_test8001 returned rc=1: ORA-12541")
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.verify_sqlcl_connection", boom
+    )
+
+    with pytest.raises(ApexBuilderError) as exc:
+        apex_connect(profile_name="DEV1")
+
+    assert exc.value.code == "SQLCL_CONN_UNREACHABLE"
+    assert "ereport_test8001" in exc.value.message
+    assert "ORA-12541" in exc.value.suggestion
+
+
+def test_status_reports_auth_mode_after_sqlcl_connect(
+    monkeypatch, tmp_sqlcl_profile_yaml
+):
+    """apex_status must expose auth_mode so pool_connected=false is interpretable."""
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.PROFILES_YAML", tmp_sqlcl_profile_yaml
+    )
+    fake_md = MagicMock()
+    fake_md.dsn = "x"
+    fake_md.user = "u"
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.read_connection_metadata", lambda n: fake_md
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools.connection.verify_sqlcl_connection", lambda n: True
+    )
+
+    apex_connect(profile_name="DEV1")
+    s = apex_status()
+    assert s["state"] == "CONNECTED:DEV"
+    assert s["auth_mode"] == "sqlcl"
+    assert s["pool_connected"] is False  # no oracledb pool was opened in sqlcl mode
+
+
 def test_connect_auto_loads_read_categories(monkeypatch, tmp_profiles_yaml):
     """After successful connect, READ_DB + READ_APEX categories should be loaded."""
     monkeypatch.setattr(
