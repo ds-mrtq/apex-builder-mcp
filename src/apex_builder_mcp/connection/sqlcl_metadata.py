@@ -3,9 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+# SQLcl 26.1 emits plain text when stdout is a pipe, but future versions or
+# different TERM settings could emit CSI sequences. Strip them defensively so
+# field parsing stays robust.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_CSI_RE.sub("", s)
 
 
 class SqlclConnectionNotFoundError(KeyError):
@@ -50,7 +60,8 @@ def _parse_connmgr_show(output: str, name: str) -> SqlclConnectionMetadata:
         Password: ******
     """
     fields: dict[str, str] = {}
-    for line in output.splitlines():
+    for raw_line in output.splitlines():
+        line = _strip_ansi(raw_line)
         if ":" in line:
             key, _, val = line.partition(":")
             fields[key.strip().lower()] = val.strip()
@@ -75,19 +86,28 @@ def _read_via_connmgr(name: str) -> SqlclConnectionMetadata:
     """Fallback: invoke `sql /nolog` + `connmgr show <name>`."""
     sql = f"connmgr show {name}\nexit\n"
     env = {**os.environ, "MSYS2_ARG_CONV_EXCL": "*"}
-    proc = subprocess.run(
-        ["sql", "/nolog"],
-        input=sql,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=30,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            ["sql", "/nolog"],
+            input=sql,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired as e:
+        last_out = (e.stdout or "")[-500:] if isinstance(e.stdout, str) else ""
+        last_err = (e.stderr or "")[-500:] if isinstance(e.stderr, str) else ""
+        raise SqlclConnectionNotFoundError(
+            f"sql connmgr show {name} timed out after 30s. "
+            f"last stdout: {last_out!r} last stderr: {last_err!r}"
+        ) from e
     if proc.returncode != 0:
         raise SqlclConnectionNotFoundError(
-            f"sql connmgr show {name} failed (rc={proc.returncode}): {proc.stderr}"
+            f"sql connmgr show {name} failed (rc={proc.returncode}): "
+            f"stdout={proc.stdout[-500:]!r} stderr={proc.stderr[-500:]!r}"
         )
     return _parse_connmgr_show(proc.stdout, name)
 

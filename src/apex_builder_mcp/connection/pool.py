@@ -1,11 +1,27 @@
 # src/apex_builder_mcp/connection/pool.py
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 import oracledb
 
 from apex_builder_mcp.schema.profile import Profile
+
+# Default TCP connect timeout for oracledb. Without this, a wrong DSN or
+# firewalled host can stall the MCP server for minutes. Override with
+# APEX_BUILDER_TCP_CONNECT_TIMEOUT_SEC.
+DEFAULT_TCP_CONNECT_TIMEOUT_SEC = 10
+
+
+def _tcp_connect_timeout_sec() -> int:
+    raw = os.environ.get("APEX_BUILDER_TCP_CONNECT_TIMEOUT_SEC")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_TCP_CONNECT_TIMEOUT_SEC
 
 
 class PoolNotConnectedError(RuntimeError):
@@ -37,6 +53,7 @@ class ApexBuilderPool:
             max=4,
             increment=1,
             getmode=oracledb.POOL_GETMODE_WAIT,
+            tcp_connect_timeout=_tcp_connect_timeout_sec(),
         )
         # Only assign on success
         self._pool = new_pool

@@ -51,6 +51,21 @@ def test_pool_disconnect(monkeypatch):
     fake_pool.close.assert_called_once()
 
 
+def test_pool_passes_tcp_connect_timeout(monkeypatch):
+    """create_pool must receive tcp_connect_timeout so wrong DSN fails fast."""
+    fake_pool = MagicMock()
+    fake_oracledb = MagicMock()
+    fake_oracledb.create_pool = MagicMock(return_value=fake_pool)
+    monkeypatch.setattr("apex_builder_mcp.connection.pool.oracledb", fake_oracledb)
+    monkeypatch.setenv("APEX_BUILDER_TCP_CONNECT_TIMEOUT_SEC", "7")
+
+    p = ApexBuilderPool()
+    p.connect(profile=make_profile(), dsn="h:1521/svc", user="u", password="p")
+
+    kwargs = fake_oracledb.create_pool.call_args.kwargs
+    assert kwargs["tcp_connect_timeout"] == 7
+
+
 def test_pool_reconnect_failure_clears_stale_state(monkeypatch):
     """If create_pool raises during reconnect, state must be cleared (no stale pool)."""
     fake_pool_first = MagicMock()

@@ -106,6 +106,51 @@ def test_parse_connmgr_show_missing_connect_string():
         _parse_connmgr_show("Name: x\nUser: y", "x")
 
 
+def test_parse_connmgr_show_strips_ansi_escapes():
+    """Defense-in-depth: future SQLcl versions may emit CSI sequences even to pipes."""
+    from apex_builder_mcp.connection.sqlcl_metadata import _parse_connmgr_show
+
+    sample = (
+        "\x1b[1mName:\x1b[0m my_conn\n"
+        "\x1b[1mConnect String:\x1b[0m host.example:1521/SVC\n"
+        "\x1b[1mUser:\x1b[0m EREPORT\n"
+    )
+    md = _parse_connmgr_show(sample, "my_conn")
+    assert md.host == "host.example"
+    assert md.port == 1521
+    assert md.service_name == "SVC"
+    assert md.user == "EREPORT"
+
+
+def test_read_via_connmgr_timeout_surfaces_evidence(monkeypatch, tmp_path):
+    """Never swallow evidence: timeout error must include last subprocess output."""
+    import subprocess
+    from apex_builder_mcp.connection.sqlcl_metadata import (
+        SqlclConnectionNotFoundError,
+        read_connection_metadata,
+    )
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0] if args else "sql",
+            timeout=30,
+            output="partial stdout snippet",
+            stderr="partial stderr snippet",
+        )
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.connection.sqlcl_metadata.subprocess.run", boom
+    )
+    nonexistent = tmp_path / "no.json"
+    with pytest.raises(SqlclConnectionNotFoundError) as exc:
+        read_connection_metadata("my_conn", connections_file=nonexistent)
+
+    msg = str(exc.value)
+    assert "timed out" in msg
+    assert "partial stdout snippet" in msg
+    assert "partial stderr snippet" in msg
+
+
 def test_read_connection_metadata_falls_back_to_connmgr(monkeypatch, tmp_path):
     from apex_builder_mcp.connection.sqlcl_metadata import (
         read_connection_metadata,
