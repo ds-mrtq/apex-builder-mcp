@@ -1,9 +1,15 @@
 # src/apex_builder_mcp/__main__.py
 from __future__ import annotations
 
+import logging
+import os
+
 from fastmcp import FastMCP
 
+from apex_builder_mcp.registry.categories import Category
 from apex_builder_mcp.registry.tool_decorator import get_registered_tools
+
+logger = logging.getLogger(__name__)
 
 # Import tool modules so @apex_tool decorators populate _REGISTERED_TOOLS.
 # All tool modules must be imported here for the registry to know about them
@@ -35,6 +41,44 @@ from apex_builder_mcp.tools import shared_components as _shared_components  # no
 from apex_builder_mcp.tools.lazy import _get_loader
 
 
+def _parse_eager_categories() -> list[Category]:
+    """Parse APEX_BUILDER_EAGER_CATEGORIES into a list of Category to load at startup.
+
+    Why this exists: FastMCP 3.2.4 server-side `add_tool` does not emit
+    `notifications/tools/list_changed`, so MCP clients (e.g. Claude Code)
+    cache the tool list from the initial handshake and never see categories
+    loaded mid-session via apex_connect / apex_load_category. Setting this
+    env var pre-loads categories before the handshake so the full surface
+    is visible from session start.
+
+    Accepts: 'all' (every category), or a comma-separated list of category
+    names (e.g. 'read_db,read_apex,write_core'). Unknown names are silently
+    skipped — we never brick startup over a typo. Empty/unset keeps the
+    default lazy behavior.
+    """
+    raw = os.environ.get("APEX_BUILDER_EAGER_CATEGORIES", "").strip()
+    if not raw:
+        return []
+    if raw.lower() == "all":
+        return [c for c in Category if not c.always_loaded]
+    result: list[Category] = []
+    for name in raw.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            cat = Category(name)
+        except ValueError:
+            logger.warning(
+                "APEX_BUILDER_EAGER_CATEGORIES: unknown category %r — skipped", name
+            )
+            continue
+        if cat.always_loaded:
+            continue  # no-op, already loaded
+        result.append(cat)
+    return result
+
+
 def build_server() -> FastMCP:
     """Build a FastMCP server wired to the shared LazyToolLoader.
 
@@ -45,6 +89,19 @@ def build_server() -> FastMCP:
     """
     server = FastMCP("apex-builder-mcp")
     loader = _get_loader()  # SAME singleton as tools/lazy.py uses
+
+    # Eager-load extra categories from env BEFORE wiring the notify callback,
+    # so initial sync_tools() registers everything in one shot. This is the
+    # workaround for FastMCP 3.2.4 not emitting notifications/tools/list_changed
+    # on dynamic add_tool — MCP clients only see the surface at handshake.
+    eager = _parse_eager_categories()
+    for cat in eager:
+        loader.load(cat)  # _notify is None at this point — no callback fires
+    if eager:
+        logger.info(
+            "APEX_BUILDER_EAGER_CATEGORIES: pre-loaded %s",
+            ", ".join(c.value for c in eager),
+        )
 
     # Track which tool names we have registered with the server.
     _registered_tool_names: set[str] = set()

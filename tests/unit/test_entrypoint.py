@@ -37,6 +37,67 @@ def test_only_always_loaded_visible_at_startup():
         assert required in tool_names, f"missing {required}; got {tool_names}"
 
 
+def test_parse_eager_categories_empty():
+    """Unset/empty env => no eager categories."""
+    import os
+    from apex_builder_mcp.__main__ import _parse_eager_categories
+
+    os.environ.pop("APEX_BUILDER_EAGER_CATEGORIES", None)
+    assert _parse_eager_categories() == []
+    os.environ["APEX_BUILDER_EAGER_CATEGORIES"] = ""
+    try:
+        assert _parse_eager_categories() == []
+    finally:
+        os.environ.pop("APEX_BUILDER_EAGER_CATEGORIES", None)
+
+
+def test_parse_eager_categories_all(monkeypatch):
+    """'all' loads every non-always-loaded category."""
+    from apex_builder_mcp.__main__ import _parse_eager_categories
+
+    monkeypatch.setenv("APEX_BUILDER_EAGER_CATEGORIES", "all")
+    result = _parse_eager_categories()
+    assert Category.READ_DB in result
+    assert Category.READ_APEX in result
+    assert Category.WRITE_CORE in result
+    assert Category.BRIDGES in result
+    # Always-loaded must NOT appear (they're loaded by bootstrap already)
+    for c in result:
+        assert not c.always_loaded
+
+
+def test_parse_eager_categories_csv(monkeypatch):
+    """Comma-separated list parses cleanly; unknown names skipped, not fatal."""
+    from apex_builder_mcp.__main__ import _parse_eager_categories
+
+    monkeypatch.setenv(
+        "APEX_BUILDER_EAGER_CATEGORIES",
+        " read_db , write_core , nonsense ,, read_apex ",
+    )
+    result = _parse_eager_categories()
+    assert Category.READ_DB in result
+    assert Category.READ_APEX in result
+    assert Category.WRITE_CORE in result
+    assert Category.BRIDGES not in result
+
+
+def test_eager_load_makes_write_tools_visible_at_handshake(monkeypatch):
+    """With APEX_BUILDER_EAGER_CATEGORIES=write_core, write tools are in tools/list
+    BEFORE any apex_load_category call.
+
+    This is the workaround for FastMCP 3.2.4 not emitting tools/list_changed —
+    without eager-load, MCP clients never see categories loaded mid-session.
+    """
+    monkeypatch.setenv("APEX_BUILDER_EAGER_CATEGORIES", "write_core")
+
+    server = build_server()
+    names = set(_list_tool_names(server))
+    # Pick a couple of write_core tools that exist at v0.0.4
+    assert "apex_add_page" in names, f"apex_add_page missing; got {sorted(names)[:10]}..."
+    assert "apex_create_app" in names
+    assert "apex_generate_crud" in names  # generators live in WRITE_CORE
+
+
 def test_load_category_registers_tools_with_server():
     """Verify the lazy loader integration: loading a category triggers add_tool."""
     # Sanity: write_core tools NOT initially loaded
