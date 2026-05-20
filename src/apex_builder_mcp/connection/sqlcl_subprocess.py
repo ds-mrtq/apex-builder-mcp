@@ -61,8 +61,24 @@ def run_sqlcl(
     timeout: int = 180,
     raise_on_db_error: bool = False,
 ) -> SqlclResult:
-    """Run SQL/PLSQL via `sql -name <conn>`. Returns rc/stdout/stderr."""
-    env = {**os.environ, "MSYS2_ARG_CONV_EXCL": "*"}
+    """Run SQL/PLSQL via `sql -name <conn>`. Returns rc/stdout/stderr.
+
+    Bug #3 (HT_AMMS 2026-05-20): SQLcl on Windows defaults to
+    NLS_LANG=AMERICAN_AMERICA.WE8MSWIN1252 unless overridden, which
+    double-encodes UTF-8 strings passed in via stdin (e.g. "Cấu hình" stored
+    as "Cáº¥u hÃ¬nh"). We pipe `sql_text` as UTF-8 bytes, so we must tell
+    SQLcl the client charset is also UTF-8 to round-trip cleanly into the
+    UTF8/AL32UTF8 DB. APEX_BUILDER_NLS_LANG env var overrides; otherwise
+    we default to AL32UTF8.
+    """
+    nls_lang = os.environ.get(
+        "APEX_BUILDER_NLS_LANG", "AMERICAN_AMERICA.AL32UTF8"
+    )
+    env = {
+        **os.environ,
+        "MSYS2_ARG_CONV_EXCL": "*",
+        "NLS_LANG": nls_lang,
+    }
     proc = subprocess.run(
         ["sql", "-name", conn_name],
         input=sql_text,

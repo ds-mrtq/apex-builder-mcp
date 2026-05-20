@@ -41,6 +41,7 @@ This mirrors APEX export conventions and keeps the call site simple.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from apex_builder_mcp.apex_api.import_session import ImportSession
@@ -187,6 +188,80 @@ def apex_add_form_region(
 # ---------------------------------------------------------------------------
 
 
+# Regex matches a top-level ORDER BY clause at the tail of a query.
+# Multiline + case-insensitive; tolerates trailing semicolon / whitespace.
+# Conservative: only strips ORDER BY that appears AFTER the last FROM, so a
+# subquery ORDER BY inside a derived table won't trigger (those are rare and
+# the heuristic prefers false negatives over false positives).
+_ORDER_BY_TAIL_RE = re.compile(
+    r"\s+ORDER\s+BY\s+[^()]*?\s*;?\s*$",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+
+def _has_trailing_order_by(sql: str) -> bool:
+    """True if the SQL ends with an ORDER BY clause (APEX IG rejects this)."""
+    return bool(_ORDER_BY_TAIL_RE.search(sql))
+
+
+def _build_region_column_block(
+    region_col_id: int,
+    app_id: int,
+    page_id: int,
+    region_id: int,
+    col_name: str,
+    col_data_type: str,
+    display_seq: int,
+) -> str:
+    """Emit a wwv_flow_imp_page.create_region_column call for one IG column.
+
+    Required APEX 24.2 params (from ALL_ARGUMENTS): P_NAME, P_DISPLAY_SEQUENCE.
+    We pass P_ID + P_FLOW_ID + P_PAGE_ID + P_REGION_ID so APEX can wire the
+    FK to the parent region, plus P_DATA_TYPE / P_SOURCE_TYPE='DB_COLUMN' /
+    P_SOURCE_EXPRESSION so the column metadata is complete enough that the
+    downstream create_ig_report_column can reference it without NULL FKs.
+    """
+    n = col_name.replace("'", "''")
+    dt = col_data_type.replace("'", "''")
+    return f"""  wwv_flow_imp_page.create_region_column(
+    p_id => {region_col_id},
+    p_flow_id => {app_id},
+    p_page_id => {page_id},
+    p_region_id => {region_id},
+    p_name => '{n}',
+    p_source_type => 'DB_COLUMN',
+    p_source_expression => '{n}',
+    p_data_type => '{dt}',
+    p_heading => '{n}',
+    p_label => '{n}',
+    p_display_sequence => {display_seq}
+  );
+"""
+
+
+def _build_ig_report_column_block(
+    ig_report_col_id: int,
+    view_id: int,
+    region_col_id: int,
+    display_seq: int,
+) -> str:
+    """Emit wwv_flow_imp_page.create_ig_report_column for one IG column in one view.
+
+    Required APEX 24.2 params: P_VIEW_ID, P_DISPLAY_SEQ. P_COLUMN_ID is
+    defaulted but MUST be set explicitly so the per-view column references
+    the parent region column row (created via create_region_column) —
+    otherwise WWV_FLOW_IG_REPORT_COLUMNS.column_id is NULL and Page
+    Designer Save raises ORA-01400 (Bug #2c).
+    """
+    return f"""  wwv_flow_imp_page.create_ig_report_column(
+    p_id => {ig_report_col_id},
+    p_view_id => {view_id},
+    p_column_id => {region_col_id},
+    p_display_seq => {display_seq}
+  );
+"""
+
+
 @apex_tool(name="apex_add_interactive_grid", category=Category.WRITE_CORE)
 def apex_add_interactive_grid(
     app_id: int,
@@ -194,33 +269,48 @@ def apex_add_interactive_grid(
     region_id: int,
     sql_query: str,
     name: str,
+    columns: list[dict[str, str]] | None = None,
     template_id: int = 0,
     display_sequence: int = 10,
 ) -> dict[str, Any]:
     """Add a NATIVE_IG (interactive grid) region with default report+view. DEV-only.
 
-    Composes four create_* calls in a single ImportSession PL/SQL body:
+    When ``columns`` is supplied (recommended), composes the full IG metadata
+    graph in a single ImportSession PL/SQL body:
       1. create_page_plug          -> the IG region (source_type='NATIVE_IG')
-      2. create_interactive_grid   -> IG component metadata
-      3. create_ig_report          -> 'Primary Report' (type=PRIMARY,
-                                      default_view=GRID)
-      4. create_ig_report_view     -> the default GRID view
+      2. create_region_column      -> per data column (Bug #2c fix)
+      3. create_interactive_grid   -> IG component metadata
+      4. create_ig_report          -> 'Primary Report' (type=PRIMARY, default_view=GRID)
+      5. create_ig_report_view     -> the default GRID view
+      6. create_ig_report_column   -> per data column linked to view (Bug #2c fix)
 
-    Derived ids (kept simple so caller supplies only region_id):
-      ig_id     = region_id          (the IG matches the region)
+    When ``columns`` is None (legacy), only steps 1, 3, 4, 5 fire — the IG
+    will render ORA-01403 at runtime and Page Designer Save raises ORA-01400
+    on WWV_FLOW_IG_REPORT_COLUMNS. Caller gets a warning in the response.
+
+    Args:
+      app_id, page_id, region_id: target IDs.
+      sql_query: SELECT statement for the IG source.
+      name: display name for the region.
+      columns: list of {"name": str, "data_type": str} dicts describing the
+        SELECT clause columns in order. data_type values: 'VARCHAR2', 'NUMBER',
+        'DATE', 'TIMESTAMP', 'CLOB'. When supplied, this drives full metadata
+        seeding so Save works without UI repair. Example:
+        [{"name": "lane_code", "data_type": "VARCHAR2"},
+         {"name": "step_code", "data_type": "VARCHAR2"},
+         {"name": "display_order", "data_type": "NUMBER"}]
+      template_id, display_sequence: region rendering settings.
+
+    Derived ids (so caller supplies only region_id):
+      ig_id     = region_id
       report_id = region_id + 1
       view_id   = region_id + 2
+      region_col_ids   = region_id*1000 + 0, 1, 2, ...   (one per column)
+      ig_report_col_ids= region_id*1000 + 500, 501, 502, ... (offset 500)
 
-    APEX 24.2 required args (Phase 2B-3 ALL_ARGUMENTS discovery):
-      CREATE_INTERACTIVE_GRID  - all params defaulted; we still pass
-                                 p_id+p_flow_id+p_page_id+p_region_id.
-      CREATE_IG_REPORT         - p_interactive_grid_id, p_type, p_default_view
-      CREATE_IG_REPORT_VIEW    - p_report_id, p_view_type
-
-    Advanced features (column controls per column, filters, master-detail
-    relationships, multiple report views) require additional create_ig_* calls
-    and per-column metadata; deferred to Phase 3. Configure via App Builder UI
-    after this tool seeds the base IG.
+    sql_query constraints:
+      - ORDER BY at the end is REJECTED (APEX IG validates and rejects this).
+        Tool raises IG_SQL_HAS_ORDER_BY before any PL/SQL runs.
 
     expected_delta = {"regions": 1}
     """
@@ -233,14 +323,62 @@ def apex_add_interactive_grid(
         )
     profile = state.profile
 
+    # Bug #1 (HT_AMMS 2026-05-20): APEX IG validates SQL and rejects ORDER BY
+    # at save time. Without this guard the tool reports success while the
+    # region is created in a broken state (ORA-01403 at runtime + RED in
+    # Page Designer). Reject early with a clear suggestion.
+    if _has_trailing_order_by(sql_query):
+        raise ApexBuilderError(
+            code="IG_SQL_HAS_ORDER_BY",
+            message=(
+                "Interactive Grid sql_query must NOT end with ORDER BY — "
+                "APEX IG uses column-level sorting instead and rejects the "
+                "SQL at save time (you'd see a RED region in Page Designer "
+                "and ORA-01403 at runtime)."
+            ),
+            suggestion=(
+                "Remove the trailing ORDER BY clause from sql_query. "
+                "Configure default sort order via IG column metadata "
+                "(p_sort_order / p_sort_direction on create_ig_report_column) "
+                "or in the App Builder UI Column attributes."
+            ),
+            sql_attempted=sql_query,
+        )
+
     ig_id = region_id
     report_id = region_id + 1
     view_id = region_id + 2
 
+    # Validate columns list (if supplied) — fail-fast before any PL/SQL.
+    _ALLOWED_DATA_TYPES = {"VARCHAR2", "NUMBER", "DATE", "TIMESTAMP", "CLOB"}
+    if columns is not None:
+        if not columns:
+            raise ApexBuilderError(
+                code="IG_COLUMNS_EMPTY",
+                message="columns=[] is not allowed — pass None to skip column seeding, or supply at least one column dict.",
+                suggestion="Either omit the columns argument (legacy bare-IG, Bug #2c) or supply non-empty [{'name':..., 'data_type':...}, ...].",
+            )
+        for i, col in enumerate(columns):
+            n = col.get("name")
+            dt = (col.get("data_type") or "").upper()
+            if not n:
+                raise ApexBuilderError(
+                    code="IG_COLUMNS_BAD_NAME",
+                    message=f"columns[{i}] missing 'name'",
+                    suggestion="Each column dict must have a non-empty 'name'.",
+                )
+            if dt not in _ALLOWED_DATA_TYPES:
+                raise ApexBuilderError(
+                    code="IG_COLUMNS_BAD_TYPE",
+                    message=f"columns[{i}] data_type={col.get('data_type')!r} unsupported",
+                    suggestion=f"Allowed data_type values: {sorted(_ALLOWED_DATA_TYPES)}.",
+                )
+
     # Escape single quotes in sql_query for embedding
     sql_escaped = sql_query.replace("'", "''")
 
-    plsql_body = f"""  wwv_flow_imp_page.create_page_plug(
+    # Block 1: region container
+    blocks: list[str] = [f"""  wwv_flow_imp_page.create_page_plug(
     p_id => {region_id},
     p_flow_id => {app_id},
     p_page_id => {page_id},
@@ -251,7 +389,23 @@ def apex_add_interactive_grid(
     p_query_type => 'SQL',
     p_plug_source => '{sql_escaped}'
   );
-  wwv_flow_imp_page.create_interactive_grid(
+"""]
+
+    # Block 2 (Bug #2c fix): one create_region_column per data column
+    if columns is not None:
+        for i, col in enumerate(columns):
+            blocks.append(_build_region_column_block(
+                region_col_id=region_id * 1000 + i,
+                app_id=app_id,
+                page_id=page_id,
+                region_id=region_id,
+                col_name=col["name"],
+                col_data_type=col["data_type"].upper(),
+                display_seq=(i + 1) * 10,
+            ))
+
+    # Block 3-5: IG component + report + view
+    blocks.append(f"""  wwv_flow_imp_page.create_interactive_grid(
     p_id => {ig_id},
     p_flow_id => {app_id},
     p_page_id => {page_id},
@@ -272,7 +426,33 @@ def apex_add_interactive_grid(
     p_report_id => {report_id},
     p_view_type => 'GRID'
   );
-"""
+""")
+
+    # Block 6 (Bug #2c fix): one create_ig_report_column per data column,
+    # linking each per-view column to its parent region column.
+    if columns is not None:
+        for i, _ in enumerate(columns):
+            blocks.append(_build_ig_report_column_block(
+                ig_report_col_id=region_id * 1000 + 500 + i,
+                view_id=view_id,
+                region_col_id=region_id * 1000 + i,
+                display_seq=(i + 1) * 10,
+            ))
+
+    plsql_body = "".join(blocks)
+
+    # Warning surfaced both in dry-run and live responses when caller skips
+    # column metadata. The resulting IG cannot Save from Page Designer
+    # without raising ORA-01400 — see Bug #2c.
+    warnings: list[str] = []
+    if columns is None:
+        warnings.append(
+            "columns=None: IG region created without per-column metadata. "
+            "Save from Page Designer will raise ORA-01400 on "
+            "WWV_FLOW_IG_REPORT_COLUMNS (Bug #2c). Pass columns=[{'name':..., "
+            "'data_type':...}, ...] to seed the full metadata graph."
+        )
+    column_count = len(columns) if columns is not None else 0
 
     decision = enforce_policy(
         PolicyContext(
@@ -288,6 +468,8 @@ def apex_add_interactive_grid(
             "ig_id": ig_id,
             "report_id": report_id,
             "view_id": view_id,
+            "column_count": column_count,
+            "warnings": warnings,
             "sql_preview": (
                 f"-- import_begin/import_end wrap for app {app_id}\n"
                 f"-- body:\n{plsql_body}"
@@ -337,6 +519,8 @@ def apex_add_interactive_grid(
         "ig_id": ig_id,
         "report_id": report_id,
         "view_id": view_id,
+        "column_count": column_count,
+        "warnings": warnings,
         "name": name,
         "alias": alias,
         "before": {"pages": before.pages, "regions": before.regions, "items": before.items},

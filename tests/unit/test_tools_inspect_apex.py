@@ -181,6 +181,109 @@ def test_describe_page_with_components(monkeypatch):
     assert result["found"] is True
 
 
+def test_describe_page_sqlcl_csv_parsing(monkeypatch):
+    """Bug #4 (HT_AMMS 2026-05-20): describe_page over sqlcl auth_mode used
+    pipe-concat queries with `prompt` section markers. SQLcl echoed the SQL
+    statements (containing literal `|||` separators) and the parser treated
+    them as data rows, polluting page_name with literal SQL fragments and
+    losing real rows. Fix uses CSV mode + sentinel single-cell rows.
+
+    Validates: PAGE single-row + REGIONS list + ITEMS list + BUTTONS list +
+    PROCESSES list, with Unicode-clean strings.
+    """
+    from apex_builder_mcp.tools._read_helpers import _query_describe_page_sqlcl
+    from apex_builder_mcp.schema.profile import Profile
+
+    profile = Profile(
+        sqlcl_name="ereport_test8001",
+        environment="DEV",
+        workspace="EREPORT",
+        auth_mode="sqlcl",
+    )
+
+    # Realistic SQLcl CSV output: header off (single set), one row per
+    # section, sentinel rows in between. Strings double-quoted; numbers raw.
+    fake_csv = (
+        # PAGE section (1 row, 4 cols)
+        '"Cấu hình Lane / Phase","LANE-PHASE-CFG","NORMAL","Y"\n'
+        # REGIONS sentinel + 2 region rows
+        '"XX_APEX_BUILDER_REGIONS_XX"\n'
+        '100,"R1 — Lane registry","BODY",10\n'
+        '200,"R2 — Step config","BODY",20\n'
+        # ITEMS sentinel + 1 item row
+        '"XX_APEX_BUILDER_ITEMS_XX"\n'
+        '500,"P10_LANE_FILTER","SELECT_LIST",100\n'
+        # BUTTONS sentinel (no buttons)
+        '"XX_APEX_BUILDER_BUTTONS_XX"\n'
+        # PROCESSES sentinel (no procs)
+        '"XX_APEX_BUILDER_PROCESSES_XX"\n'
+    )
+    # Also throw in some banner / echo noise to confirm filter
+    fake_csv = (
+        "SQLcl: Release 26.1 Production on Wed May 20 09:00:00 2026\n"
+        "Connected to:\n"
+        "Oracle Database 19c\n"
+        + fake_csv
+        + "Disconnected from Oracle Database 19c\n"
+    )
+
+    def fake_sqlcl_or_raise(profile, sql, *, tool_label):
+        # Sanity: the new SQL must use sqlformat csv, not the old pipe approach
+        assert "set sqlformat csv" in sql
+        assert "XX_APEX_BUILDER_REGIONS_XX" in sql
+        assert "|||" not in sql, "old pipe-concat pattern leaked back in"
+        return fake_csv
+
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools._read_helpers._sqlcl_or_raise",
+        fake_sqlcl_or_raise,
+    )
+
+    result = _query_describe_page_sqlcl(profile, app_id=1000, page_id=10)
+    assert result is not None
+    # PAGE: Unicode round-trip (assuming NLS_LANG fix is in place)
+    assert result["page_name"] == "Cấu hình Lane / Phase"
+    assert "select" not in result["page_name"].lower(), (
+        "SQL fragments must not leak into page_name (regression for Bug #4)"
+    )
+    assert result["page_alias"] == "LANE-PHASE-CFG"
+    assert result["page_mode"] == "NORMAL"
+    assert result["requires_authentication"] == "Y"
+    # REGIONS: 2 rows
+    assert len(result["regions"]) == 2
+    assert result["regions"][0]["region_id"] == 100
+    assert result["regions"][0]["name"] == "R1 — Lane registry"
+    assert result["regions"][1]["region_id"] == 200
+    # ITEMS: 1 row (was empty before fix)
+    assert len(result["items"]) == 1
+    assert result["items"][0]["item_id"] == 500
+    assert result["items"][0]["name"] == "P10_LANE_FILTER"
+    # BUTTONS / PROCESSES: empty
+    assert result["buttons"] == []
+    assert result["processes"] == []
+
+
+def test_describe_page_sqlcl_no_page_returns_none(monkeypatch):
+    """If PAGE section yields no rows, return None (page not found)."""
+    from apex_builder_mcp.tools._read_helpers import _query_describe_page_sqlcl
+    from apex_builder_mcp.schema.profile import Profile
+
+    profile = Profile(
+        sqlcl_name="x", environment="DEV", workspace="W", auth_mode="sqlcl"
+    )
+    fake_csv = (
+        '"XX_APEX_BUILDER_REGIONS_XX"\n'
+        '"XX_APEX_BUILDER_ITEMS_XX"\n'
+        '"XX_APEX_BUILDER_BUTTONS_XX"\n'
+        '"XX_APEX_BUILDER_PROCESSES_XX"\n'
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.tools._read_helpers._sqlcl_or_raise",
+        lambda profile, sql, *, tool_label: fake_csv,
+    )
+    assert _query_describe_page_sqlcl(profile, 999, 999) is None
+
+
 def test_describe_page_not_found(monkeypatch):
     _setup_state()
     monkeypatch.setattr(

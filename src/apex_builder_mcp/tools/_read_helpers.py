@@ -1027,142 +1027,156 @@ def query_list_pages(profile: Profile, app_id: int) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+# Section sentinels for describe_page CSV output. Unique enough that they
+# won't appear inside APEX metadata column values.
+_DP_SENTINEL_REGIONS = "XX_APEX_BUILDER_REGIONS_XX"
+_DP_SENTINEL_ITEMS = "XX_APEX_BUILDER_ITEMS_XX"
+_DP_SENTINEL_BUTTONS = "XX_APEX_BUILDER_BUTTONS_XX"
+_DP_SENTINEL_PROCESSES = "XX_APEX_BUILDER_PROCESSES_XX"
+
+
 def _query_describe_page_sqlcl(
     profile: Profile, app_id: int, page_id: int
 ) -> dict[str, Any] | None:
+    """Describe a page using SQLcl CSV format, parsing with stdlib csv module.
+
+    Bug #4 (HT_AMMS 2026-05-20): the previous implementation used
+    pipe-concatenated `||` queries with `prompt {SEP}X{SEP}` markers. SQLcl
+    on stdin echoed the SQL statements even with `set echo off`, and the
+    echoed lines happened to contain 4 `|||` separators (from the literal
+    `'|||'` markers in the query string), so `_split_row` parsed the echo
+    as a valid 4-column data row — polluting `page_row` with literal SQL
+    fragments. Rewriting with CSV mode + sentinel single-cell separator
+    rows side-steps the issue entirely (data row shape is unambiguous;
+    no `|||` matching against query literals).
+    """
     sql = (
-        "set heading off feedback off pagesize 0 echo off\n"
-        f"prompt {SEP}PAGE{SEP}\n"
-        f"select page_name||'{SEP}'||nvl(page_alias, ' ')||'{SEP}'||"
-        f"nvl(page_mode, ' ')||'{SEP}'||nvl(requires_authentication, ' ') "
+        "set sqlformat csv\n"
+        "set heading off feedback off pagesize 50000 echo off termout on\n"
+        # Section: PAGE (4 cols)
+        f"select page_name, page_alias, page_mode, requires_authentication "
         f"from apex_application_pages where application_id = {app_id} "
         f"and page_id = {page_id};\n"
-        f"prompt {SEP}REGIONS{SEP}\n"
-        f"select to_char(region_id)||'{SEP}'||region_name||'{SEP}'||"
-        f"nvl(display_position, ' ')||'{SEP}'||to_char(nvl(display_sequence, 0)) "
+        f"select '{_DP_SENTINEL_REGIONS}' from dual;\n"
+        # Section: REGIONS (4 cols)
+        f"select region_id, region_name, display_position, display_sequence "
         f"from apex_application_page_regions where application_id = {app_id} "
         f"and page_id = {page_id} order by display_sequence;\n"
-        f"prompt {SEP}ITEMS{SEP}\n"
-        f"select to_char(item_id)||'{SEP}'||item_name||'{SEP}'||"
-        f"nvl(display_as, ' ')||'{SEP}'||to_char(nvl(item_plug_id, -1)) "
+        f"select '{_DP_SENTINEL_ITEMS}' from dual;\n"
+        # Section: ITEMS (4 cols)
+        f"select item_id, item_name, display_as, item_plug_id "
         f"from apex_application_page_items where application_id = {app_id} "
         f"and page_id = {page_id} order by item_sequence;\n"
-        f"prompt {SEP}BUTTONS{SEP}\n"
-        f"select to_char(button_id)||'{SEP}'||button_name||'{SEP}'||"
-        f"to_char(nvl(button_plug_id, -1))||'{SEP}'||nvl(button_action, ' ') "
+        f"select '{_DP_SENTINEL_BUTTONS}' from dual;\n"
+        # Section: BUTTONS (4 cols)
+        f"select button_id, button_name, button_plug_id, button_action "
         f"from apex_application_page_buttons where application_id = {app_id} "
         f"and page_id = {page_id};\n"
-        f"prompt {SEP}PROCESSES{SEP}\n"
-        f"select to_char(process_id)||'{SEP}'||process_name||'{SEP}'||"
-        f"nvl(process_type, ' ')||'{SEP}'||to_char(nvl(process_sequence, 0)) "
+        f"select '{_DP_SENTINEL_PROCESSES}' from dual;\n"
+        # Section: PROCESSES (4 cols)
+        f"select process_id, process_name, process_type, process_sequence "
         f"from apex_application_page_proc where application_id = {app_id} "
         f"and page_id = {page_id} order by process_sequence;\n"
         "exit\n"
     )
     body = _sqlcl_or_raise(profile, sql, tool_label="describe_page")
-    section = ""
-    page_row: list[str] | None = None
-    regions: list[dict[str, Any]] = []
-    items: list[dict[str, Any]] = []
-    buttons: list[dict[str, Any]] = []
-    processes: list[dict[str, Any]] = []
+
+    # Parse the entire output as one CSV stream. Split into per-section
+    # row lists at sentinel rows. SQLcl emits one row per `select` (or
+    # multiple for a multi-row query), one row per line.
+    reader = csv.reader(io.StringIO(body))
+    sections: dict[str, list[list[str]]] = {
+        "PAGE": [], "REGIONS": [], "ITEMS": [], "BUTTONS": [], "PROCESSES": [],
+    }
+    sentinel_to_section = {
+        _DP_SENTINEL_REGIONS: "REGIONS",
+        _DP_SENTINEL_ITEMS: "ITEMS",
+        _DP_SENTINEL_BUTTONS: "BUTTONS",
+        _DP_SENTINEL_PROCESSES: "PROCESSES",
+    }
+    current = "PAGE"
+    for row in reader:
+        if not row:
+            continue
+        # Detect sentinel rows (single-cell, exact value match)
+        if len(row) == 1 and row[0] in sentinel_to_section:
+            current = sentinel_to_section[row[0]]
+            continue
+        # Skip noise lines that csv.reader produced from banners / disconnect
+        # text. Real data rows for each section have exactly 4 cells.
+        if len(row) != 4:
+            continue
+        # All-empty rows (rare in CSV but possible) — skip.
+        if not any(cell.strip() for cell in row):
+            continue
+        sections[current].append(row)
 
     def _opt_int(s: str) -> int | None:
         iv = _to_int_or_none(s)
         return None if iv == -1 else iv
 
-    for line in body.splitlines():
-        s = line.strip()
-        if f"{SEP}PAGE{SEP}" in s:
-            section = "PAGE"
-            continue
-        if f"{SEP}REGIONS{SEP}" in s:
-            section = "REGIONS"
-            continue
-        if f"{SEP}ITEMS{SEP}" in s:
-            section = "ITEMS"
-            continue
-        if f"{SEP}BUTTONS{SEP}" in s:
-            section = "BUTTONS"
-            continue
-        if f"{SEP}PROCESSES{SEP}" in s:
-            section = "PROCESSES"
-            continue
-        if not s:
-            continue
-        if section == "PAGE":
-            parts = _split_row(s, 4)
-            if parts is None:
-                continue
-            page_row = parts
-        elif section == "REGIONS":
-            parts = _split_row(s, 4)
-            if parts is None:
-                continue
-            rid = _to_int_or_none(parts[0])
-            if rid is None:
-                continue
-            regions.append(
-                {
-                    "region_id": rid,
-                    "name": parts[1],
-                    "position": parts[2] if parts[2].strip() else None,
-                    "sequence": _to_int_or_none(parts[3]),
-                }
-            )
-        elif section == "ITEMS":
-            parts = _split_row(s, 4)
-            if parts is None:
-                continue
-            iid = _to_int_or_none(parts[0])
-            if iid is None:
-                continue
-            items.append(
-                {
-                    "item_id": iid,
-                    "name": parts[1],
-                    "display_as": parts[2] if parts[2].strip() else None,
-                    "region_id": _opt_int(parts[3]),
-                }
-            )
-        elif section == "BUTTONS":
-            parts = _split_row(s, 4)
-            if parts is None:
-                continue
-            bid = _to_int_or_none(parts[0])
-            if bid is None:
-                continue
-            buttons.append(
-                {
-                    "button_id": bid,
-                    "name": parts[1],
-                    "region_id": _opt_int(parts[2]),
-                    "action": parts[3] if parts[3].strip() else None,
-                }
-            )
-        elif section == "PROCESSES":
-            parts = _split_row(s, 4)
-            if parts is None:
-                continue
-            pid = _to_int_or_none(parts[0])
-            if pid is None:
-                continue
-            processes.append(
-                {
-                    "process_id": pid,
-                    "name": parts[1],
-                    "type": parts[2] if parts[2].strip() else None,
-                    "sequence": _to_int_or_none(parts[3]),
-                }
-            )
+    def _empty_to_none(s: str) -> str | None:
+        return s if s and s.strip() else None
 
-    if page_row is None:
+    if not sections["PAGE"]:
         return None
+
+    # PAGE: take the FIRST row (there should be exactly one).
+    p = sections["PAGE"][0]
+
+    regions = []
+    for row in sections["REGIONS"]:
+        rid = _to_int_or_none(row[0])
+        if rid is None:
+            continue
+        regions.append({
+            "region_id": rid,
+            "name": row[1],
+            "position": _empty_to_none(row[2]),
+            "sequence": _to_int_or_none(row[3]),
+        })
+
+    items = []
+    for row in sections["ITEMS"]:
+        iid = _to_int_or_none(row[0])
+        if iid is None:
+            continue
+        items.append({
+            "item_id": iid,
+            "name": row[1],
+            "display_as": _empty_to_none(row[2]),
+            "region_id": _opt_int(row[3]),
+        })
+
+    buttons = []
+    for row in sections["BUTTONS"]:
+        bid = _to_int_or_none(row[0])
+        if bid is None:
+            continue
+        buttons.append({
+            "button_id": bid,
+            "name": row[1],
+            "region_id": _opt_int(row[2]),
+            "action": _empty_to_none(row[3]),
+        })
+
+    processes = []
+    for row in sections["PROCESSES"]:
+        pid = _to_int_or_none(row[0])
+        if pid is None:
+            continue
+        processes.append({
+            "process_id": pid,
+            "name": row[1],
+            "type": _empty_to_none(row[2]),
+            "sequence": _to_int_or_none(row[3]),
+        })
+
     return {
-        "page_name": page_row[0],
-        "page_alias": page_row[1] if page_row[1].strip() else None,
-        "page_mode": page_row[2] if page_row[2].strip() else None,
-        "requires_authentication": page_row[3] if page_row[3].strip() else None,
+        "page_name": p[0],
+        "page_alias": _empty_to_none(p[1]),
+        "page_mode": _empty_to_none(p[2]),
+        "requires_authentication": _empty_to_none(p[3]),
         "regions": regions,
         "items": items,
         "buttons": buttons,

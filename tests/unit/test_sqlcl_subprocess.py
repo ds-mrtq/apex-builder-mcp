@@ -60,6 +60,42 @@ def test_run_sqlcl_invokes_subprocess(monkeypatch):
     assert args.kwargs["timeout"] == 180
 
 
+def test_run_sqlcl_sets_nls_lang_utf8_by_default(monkeypatch):
+    """Bug #3 (HT_AMMS 2026-05-20): Without NLS_LANG=AL32UTF8 in subprocess
+    env, SQLcl on Windows defaults to WE8MSWIN1252 and double-encodes
+    UTF-8 strings passed via stdin (e.g. "Cấu hình" -> "Cáº¥u hÃ¬nh")."""
+    fake_proc = MagicMock(returncode=0, stdout="", stderr="")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return fake_proc
+
+    monkeypatch.delenv("APEX_BUILDER_NLS_LANG", raising=False)
+    monkeypatch.setattr(
+        "apex_builder_mcp.connection.sqlcl_subprocess.subprocess.run", fake_run
+    )
+    run_sqlcl("conn", "select 1 from dual;")
+    assert captured["env"]["NLS_LANG"] == "AMERICAN_AMERICA.AL32UTF8"
+
+
+def test_run_sqlcl_honors_apex_builder_nls_lang_override(monkeypatch):
+    """Operator can override NLS_LANG via env var if their DB charset isn't UTF-8."""
+    fake_proc = MagicMock(returncode=0, stdout="", stderr="")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return fake_proc
+
+    monkeypatch.setenv("APEX_BUILDER_NLS_LANG", "VIETNAMESE_VIETNAM.UTF8")
+    monkeypatch.setattr(
+        "apex_builder_mcp.connection.sqlcl_subprocess.subprocess.run", fake_run
+    )
+    run_sqlcl("conn", "select 1 from dual;")
+    assert captured["env"]["NLS_LANG"] == "VIETNAMESE_VIETNAM.UTF8"
+
+
 def test_run_sqlcl_failure_raises(monkeypatch):
     fake_proc = MagicMock()
     fake_proc.returncode = 0
