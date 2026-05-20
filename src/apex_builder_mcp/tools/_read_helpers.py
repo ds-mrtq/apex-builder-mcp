@@ -43,7 +43,12 @@ import io
 from typing import Any
 
 from apex_builder_mcp.connection.auth_mode import AuthMode, resolve_auth_mode
-from apex_builder_mcp.connection.sqlcl_subprocess import has_db_error, run_sqlcl
+from apex_builder_mcp.connection.sqlcl_subprocess import (
+    SqlclResult,
+    classify_sqlcl_failure,
+    has_db_error,
+    run_sqlcl,
+)
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
 
@@ -57,14 +62,62 @@ def _get_pool() -> Any:
     return _get_or_create_pool()
 
 
+def raise_for_sqlcl_failure(
+    profile: Profile, result: SqlclResult, *, tool_label: str
+) -> None:
+    """Raise an actionable ApexBuilderError for a failed SqlclResult.
+
+    Bug #10 (HT_AMMS 2026-05-20): the previous error `[SQLCL_QUERY_FAIL]
+    rc=1` forced the user to manually probe sqlcl to discover whether the
+    failure was a DB-down (ORA-12514), a credential rotation (ORA-01017),
+    or a real SQL error. Now we classify the failure first and raise
+    DB_UNREACHABLE with the offending ORA line + a hint when the cause is
+    connection-level; otherwise raise SQLCL_QUERY_FAIL with stdout/stderr
+    tails so the user has evidence in hand.
+    """
+    classification = classify_sqlcl_failure(result)
+    if classification is not None:
+        ora = classification["ora_code"]
+        line = classification["ora_line"]
+        hint = classification["hint"]
+        raise ApexBuilderError(
+            code="DB_UNREACHABLE",
+            message=f"{tool_label}: DB connection error — {line}",
+            suggestion=(
+                f"{hint}. Probe manually: `sql -name {profile.sqlcl_name}`. "
+                f"If the listener/instance is down, restart it or wait. "
+                f"If the saved-conn definition is stale, run "
+                f"`connmgr show {profile.sqlcl_name}` to inspect."
+            ),
+            metadata={
+                "ora_code": ora,
+                "sqlcl_rc": result.rc,
+                "stdout_tail": result.stdout[-500:],
+                "stderr_tail": result.stderr[-500:],
+            },
+        )
+    # Unrecognised failure — still surface evidence (the previous error
+    # message dropped both stdout and stderr, forcing manual repro).
+    raise ApexBuilderError(
+        code="SQLCL_QUERY_FAIL",
+        message=f"{tool_label} via SQLcl failed: rc={result.rc}",
+        suggestion=(
+            f"Check sqlcl saved connection '{profile.sqlcl_name}'. "
+            f"stdout tail: {result.stdout[-300:]!r}. "
+            f"stderr tail: {result.stderr[-300:]!r}."
+        ),
+        metadata={
+            "sqlcl_rc": result.rc,
+            "stdout_tail": result.stdout[-500:],
+            "stderr_tail": result.stderr[-500:],
+        },
+    )
+
+
 def _sqlcl_or_raise(profile: Profile, sql: str, *, tool_label: str) -> str:
     result = run_sqlcl(profile.sqlcl_name, sql, timeout=30)
     if result.rc != 0:
-        raise ApexBuilderError(
-            code="SQLCL_QUERY_FAIL",
-            message=f"{tool_label} via SQLcl failed: rc={result.rc}",
-            suggestion=f"Check sqlcl saved connection '{profile.sqlcl_name}'",
-        )
+        raise_for_sqlcl_failure(profile, result, tool_label=tool_label)
     return result.cleaned
 
 
@@ -2034,11 +2087,7 @@ def _query_run_sql_sqlcl(
     )
     result = run_sqlcl(profile.sqlcl_name, wrapped, timeout=60)
     if result.rc != 0:
-        raise ApexBuilderError(
-            code="SQLCL_QUERY_FAIL",
-            message=f"apex_run_sql via SQLcl failed: rc={result.rc}",
-            suggestion=f"Check sqlcl saved connection '{profile.sqlcl_name}'",
-        )
+        raise_for_sqlcl_failure(profile, result, tool_label="apex_run_sql")
     if has_db_error(result.stdout):
         for line in result.stdout.splitlines():
             stripped = line.strip()

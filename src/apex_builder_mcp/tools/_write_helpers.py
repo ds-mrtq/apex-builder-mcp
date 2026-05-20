@@ -18,6 +18,7 @@ from apex_builder_mcp.connection.auth_mode import AuthMode, resolve_auth_mode
 from apex_builder_mcp.connection.sqlcl_subprocess import run_sqlcl
 from apex_builder_mcp.schema.errors import ApexBuilderError
 from apex_builder_mcp.schema.profile import Profile
+from apex_builder_mcp.tools._read_helpers import raise_for_sqlcl_failure
 
 
 def _get_pool() -> Any:
@@ -41,10 +42,8 @@ def _query_workspace_id_sqlcl(profile: Profile, workspace: str) -> int:
     )
     result = run_sqlcl(profile.sqlcl_name, sql, timeout=30)
     if result.rc != 0:
-        raise ApexBuilderError(
-            code="SQLCL_QUERY_FAIL",
-            message=f"workspace_id lookup via SQLcl failed: rc={result.rc}",
-            suggestion=f"Check sqlcl saved connection '{profile.sqlcl_name}'",
+        raise_for_sqlcl_failure(
+            profile, result, tool_label="workspace_id lookup"
         )
     for line in result.cleaned.splitlines():
         s = line.strip()
@@ -70,10 +69,8 @@ def _query_metadata_snapshot_sqlcl(
     )
     result = run_sqlcl(profile.sqlcl_name, sql, timeout=30)
     if result.rc != 0:
-        raise ApexBuilderError(
-            code="SQLCL_QUERY_FAIL",
-            message=f"metadata snapshot via SQLcl failed: rc={result.rc}",
-            suggestion=f"Check sqlcl saved connection '{profile.sqlcl_name}'",
+        raise_for_sqlcl_failure(
+            profile, result, tool_label="metadata snapshot"
         )
     body = result.cleaned
     nums: list[int] = [

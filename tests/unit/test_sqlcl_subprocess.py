@@ -96,6 +96,160 @@ def test_run_sqlcl_honors_apex_builder_nls_lang_override(monkeypatch):
     assert captured["env"]["NLS_LANG"] == "VIETNAMESE_VIETNAM.UTF8"
 
 
+def test_classify_sqlcl_failure_recognizes_ora_12514():
+    """Bug #10 (HT_AMMS 2026-05-20): the canonical 'service not registered'
+    error must be classified as DB-unreachable with an actionable hint."""
+    from apex_builder_mcp.connection.sqlcl_subprocess import (
+        SqlclResult,
+        classify_sqlcl_failure,
+    )
+    result = SqlclResult(
+        rc=1,
+        stdout=(
+            "Connection failed\n"
+            "  USER          = ereport\n"
+            "  URL           = ereport_test8001\n"
+            "  Error Message = ORA-12514: Cannot connect to database. "
+            "Service TEST1 is not registered with the listener at host ebstest.example.vn port 1522.\n"
+        ),
+        stderr="",
+    )
+    c = classify_sqlcl_failure(result)
+    assert c is not None
+    assert c["ora_code"] == "ORA-12514"
+    assert "TEST1" in c["ora_line"]
+    assert "listener" in c["hint"].lower() or "instance" in c["hint"].lower()
+
+
+def test_classify_sqlcl_failure_recognizes_ora_01017():
+    """Credentials rotated — distinguishable from network issues."""
+    from apex_builder_mcp.connection.sqlcl_subprocess import (
+        SqlclResult,
+        classify_sqlcl_failure,
+    )
+    result = SqlclResult(
+        rc=1,
+        stdout="ORA-01017: invalid username/password; logon denied\n",
+        stderr="",
+    )
+    c = classify_sqlcl_failure(result)
+    assert c is not None
+    assert c["ora_code"] == "ORA-01017"
+    assert "credential" in c["hint"].lower() or "password" in c["hint"].lower()
+
+
+def test_classify_sqlcl_failure_recognizes_connection_refused():
+    """Plain-text 'Connection refused' (e.g. socket-layer rejection)
+    classified even without ORA code."""
+    from apex_builder_mcp.connection.sqlcl_subprocess import (
+        SqlclResult,
+        classify_sqlcl_failure,
+    )
+    result = SqlclResult(
+        rc=1,
+        stdout="",
+        stderr="Connection refused: connect at 172.16.0.90:1521\n",
+    )
+    c = classify_sqlcl_failure(result)
+    assert c is not None
+    assert c["ora_code"] == ""
+    assert "refused" in c["ora_line"].lower()
+
+
+def test_sqlcl_or_raise_surfaces_db_unreachable(monkeypatch):
+    """End-to-end: tool helper -> run_sqlcl -> classification -> DB_UNREACHABLE.
+
+    Reproduces the HT_AMMS Session 2 scenario: a read tool calls SQLcl,
+    SQLcl returns rc=1 with ORA-12514 in stdout. Before the fix the tool
+    raised SQLCL_QUERY_FAIL rc=1 (non-actionable). After: raises
+    DB_UNREACHABLE with the ORA line + hint + stdout_tail in metadata.
+    """
+    from apex_builder_mcp.tools._read_helpers import _sqlcl_or_raise
+    from apex_builder_mcp.schema.profile import Profile
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+
+    profile = Profile(
+        sqlcl_name="ereport_test8001",
+        environment="DEV",
+        workspace="EREPORT",
+        auth_mode="sqlcl",
+    )
+    fake_proc = MagicMock(
+        returncode=1,
+        stdout=(
+            "Connection failed\n"
+            "  Error Message = ORA-12514: Cannot connect to database. "
+            "Service TEST1 is not registered.\n"
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.connection.sqlcl_subprocess.subprocess.run",
+        MagicMock(return_value=fake_proc),
+    )
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        _sqlcl_or_raise(profile, "select 1 from dual", tool_label="probe")
+
+    err = exc_info.value
+    assert err.code == "DB_UNREACHABLE", (
+        f"expected DB_UNREACHABLE, got {err.code} — Bug #10 regression"
+    )
+    assert "ORA-12514" in err.message
+    assert "probe" in err.message  # the tool label is preserved
+    assert err.metadata["ora_code"] == "ORA-12514"
+    assert err.metadata["sqlcl_rc"] == 1
+    assert "ORA-12514" in err.metadata["stdout_tail"]
+    # Suggestion must include the saved-connection name so anh can probe
+    assert "ereport_test8001" in err.suggestion
+
+
+def test_sqlcl_or_raise_falls_back_with_evidence_on_unknown_failure(monkeypatch):
+    """Unrecognised SQLcl failures still surface stdout/stderr tails."""
+    from apex_builder_mcp.tools._read_helpers import _sqlcl_or_raise
+    from apex_builder_mcp.schema.profile import Profile
+    from apex_builder_mcp.schema.errors import ApexBuilderError
+
+    profile = Profile(
+        sqlcl_name="conn", environment="DEV", workspace="W", auth_mode="sqlcl"
+    )
+    fake_proc = MagicMock(
+        returncode=1,
+        stdout="ORA-00942: table or view does not exist\nat line 1\n",
+        stderr="extra stderr context\n",
+    )
+    monkeypatch.setattr(
+        "apex_builder_mcp.connection.sqlcl_subprocess.subprocess.run",
+        MagicMock(return_value=fake_proc),
+    )
+
+    with pytest.raises(ApexBuilderError) as exc_info:
+        _sqlcl_or_raise(profile, "select 1 from dual", tool_label="probe")
+
+    err = exc_info.value
+    # ORA-00942 is a real query error, not a connection error -> generic code
+    assert err.code == "SQLCL_QUERY_FAIL"
+    # Evidence (stdout/stderr tails) must be surfaced — was dropped before
+    assert "ORA-00942" in err.suggestion
+    assert "extra stderr context" in err.suggestion
+    assert err.metadata["stdout_tail"]
+    assert err.metadata["stderr_tail"]
+
+
+def test_classify_sqlcl_failure_returns_none_for_unknown_failure():
+    """Unrecognised rc!=0 returns None so caller falls back to generic error."""
+    from apex_builder_mcp.connection.sqlcl_subprocess import (
+        SqlclResult,
+        classify_sqlcl_failure,
+    )
+    result = SqlclResult(
+        rc=1,
+        stdout="ORA-00942: table or view does not exist\n",  # query-level, not connection
+        stderr="",
+    )
+    assert classify_sqlcl_failure(result) is None
+
+
 def test_run_sqlcl_failure_raises(monkeypatch):
     fake_proc = MagicMock()
     fake_proc.returncode = 0

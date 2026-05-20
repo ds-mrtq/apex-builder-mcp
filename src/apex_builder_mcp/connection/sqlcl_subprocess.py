@@ -25,9 +25,63 @@ _BANNER_PATTERNS = [
 
 _DB_ERROR_RE = re.compile(r"(ORA-\d+|PLS-\d+)")
 
+# ORA codes that indicate the DB itself is unreachable (instance down, listener
+# not running, network blocked, credentials revoked) — distinct from regular
+# query failures. When SQLcl rc!=0 and one of these appears in stdout/stderr,
+# we raise DB_UNREACHABLE with an actionable suggestion instead of the generic
+# SQLCL_QUERY_FAIL.
+_CONNECTION_ORA_HINTS: dict[str, str] = {
+    "ORA-12514": "Listener is up but the service name isn't registered yet "
+                 "(DB instance probably starting, stopped, or in restricted mode)",
+    "ORA-12541": "No listener at the target host:port (listener process not running)",
+    "ORA-12170": "TNS connect timeout — network reachable but no response",
+    "ORA-12545": "Connect failed — target host unreachable (network or DNS issue)",
+    "ORA-12154": "TNS could not resolve the connect identifier (saved-connection "
+                 "definition broken — run `connmgr show <name>` to inspect)",
+    "ORA-12162": "TNS net service name incorrectly specified",
+    "ORA-01017": "Invalid username/password (credentials in SQLcl saved-conn "
+                 "may have been rotated)",
+    "ORA-28000": "DB user account is locked — DBA must unlock",
+    "ORA-28001": "DB password has expired — rotate via `alter user ... identified by ...`",
+    "ORA-12526": "Listener in restricted mode — DB DBA-only",
+    "ORA-12528": "Listener blocking new connections",
+}
+
 
 class SqlclSubprocessError(RuntimeError):
     """Raised when SQLcl subprocess returns a non-zero exit or DB error."""
+
+
+def classify_sqlcl_failure(result: "SqlclResult") -> dict[str, str] | None:
+    """Inspect a failed SqlclResult; return a dict if it looks like a
+    DB-unreachable failure (ORA-12514 etc.), or a generic-rc failure with
+    a recognisable phrase ("Connection refused" / "Connection failed").
+    Returns None for unrecognised failures (caller falls back to generic).
+
+    Shape: {"ora_code": "ORA-12514", "ora_line": "<full line>", "hint": "..."}
+    """
+    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    for ora, hint in _CONNECTION_ORA_HINTS.items():
+        if ora in combined:
+            for line in combined.splitlines():
+                if ora in line:
+                    return {
+                        "ora_code": ora,
+                        "ora_line": line.strip(),
+                        "hint": hint,
+                    }
+    lower = combined.lower()
+    if "connection refused" in lower or "connection failed" in lower:
+        # Surface the most informative line
+        for line in combined.splitlines():
+            ll = line.lower()
+            if "connection refused" in ll or "connection failed" in ll:
+                return {
+                    "ora_code": "",
+                    "ora_line": line.strip(),
+                    "hint": "Network unreachable or DB process not running",
+                }
+    return None
 
 
 @dataclass(frozen=True)
